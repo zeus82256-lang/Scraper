@@ -22,7 +22,7 @@ CORS(app)
 API_SECRET = os.environ.get('API_SECRET', 'Zeusndndjddnejdjdjdejekk29393838msmskxcm9239484jdndjdnddjj99292938338zeuslojdnejxxmejj82283849')
 
 # رابط الخادم الرئيسي (Node.js)
-NODE_BACKEND_URL = os.environ.get('NODE_BACKEND_URL', 'https://c-production-e6c3.up.railway.app')
+NODE_BACKEND_URL = os.environ.get('NODE_BACKEND_URL', 'https://web-production-0616b.up.railway.app')
 
 # ==========================================
 # 🍪 إعدادات الكوكيز (تجاوز حماية تسجيل الدخول)
