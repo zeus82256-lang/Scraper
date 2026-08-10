@@ -1,5 +1,3 @@
-
-
 import os
 import json
 import time
@@ -1533,6 +1531,185 @@ def worker_erciyuan_list(url, admin_email, metadata):
         send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': batch, 'skipMetadataUpdate': True})
 
 # ==========================================
+# ⚪ 8. 52shuku.net Logic
+# ==========================================
+
+def fetch_metadata_52shuku(url):
+    try:
+        response = requests.get(url, headers=get_headers(), timeout=15)
+        if response.status_code != 200:
+            return None
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Title: from h1.article-title or <title>
+        title_tag = soup.select_one('h1.article-title')
+        if title_tag:
+            title = title_tag.get_text(strip=True)
+        else:
+            title_tag = soup.find('title')
+            if title_tag:
+                title = title_tag.get_text(strip=True)
+                # Remove site suffix
+                title = title.split('_')[0].strip()
+            else:
+                title = "Unknown Title"
+        
+        # Status: check if title contains '完结' or 'مكتملة'
+        status = "مستمرة"
+        if '完结' in title or 'مكتملة' in title:
+            status = "مكتملة"
+        
+        # Description: from first paragraph after "小说简介：" in article-content
+        description = ""
+        article = soup.find('article', class_='article-content')
+        if article:
+            desc_p = article.find('p', string=re.compile(r'小说简介'))
+            if desc_p:
+                next_p = desc_p.find_next_sibling('p')
+                if next_p:
+                    description = next_p.get_text(strip=True)
+            if not description:
+                # fallback: take a chunk of text
+                description = article.get_text(separator=' ', strip=True)[:500]
+        
+        # Cover: not available usually
+        cover = ""
+        
+        # Category and tags default
+        category = "عام"
+        tags = []
+        
+        # Last update from time tag
+        last_update = None
+        time_tag = soup.find('time', class_='muted')
+        if time_tag:
+            last_update = parse_relative_date(time_tag.get_text(strip=True))
+        
+        return {
+            'title': title,
+            'description': description,
+            'cover': cover,
+            'status': status,
+            'category': category,
+            'tags': tags,
+            'sourceUrl': url,
+            'lastUpdate': last_update
+        }
+    except Exception as e:
+        print(f"Error 52shuku metadata: {e}")
+        return None
+
+def fetch_page_list_52shuku(index_url):
+    pages = []
+    try:
+        response = requests.get(index_url, headers=get_headers(), timeout=15)
+        if response.status_code != 200:
+            return pages
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Find page links
+        page_links = soup.select('ul.list.clearfix li.mulu a')
+        if not page_links:
+            page_links = soup.select('ul.list li a')
+        
+        base_url = get_base_url(index_url)
+        
+        for a in page_links:
+            href = a.get('href')
+            if not href:
+                continue
+            full_url = urljoin(base_url, href)
+            text = a.get_text(strip=True)
+            num_match = re.search(r'(\d+)', text)
+            if num_match:
+                number = int(num_match.group(1))
+                pages.append({'number': number, 'url': full_url, 'title': f'صفحة {number}'})
+        
+        pages.sort(key=lambda x: x['number'])
+        return pages
+    except Exception as e:
+        print(f"Error 52shuku page list: {e}")
+        return pages
+
+def scrape_page_52shuku(url):
+    try:
+        response = requests.get(url, headers=get_headers(), timeout=15)
+        if response.status_code != 200:
+            return None
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Content container
+        content_div = soup.find('article', class_='article-content')
+        if not content_div:
+            content_div = soup.find('div', id='nr1')
+        if not content_div:
+            return None
+        
+        # Remove junk
+        for bad in content_div.find_all(['script', 'style', 'ins', 'iframe', 'button']):
+            bad.decompose()
+        for div in content_div.find_all('div'):
+            if div.get('id') and div.get('id').startswith('pf-'):
+                div.decompose()
+            elif div.get('class') and any(c in ['pagination2', 'breadcrumbs', 'nr_set', 'meta', 'article-nav', 'related_top'] for c in div.get('class', [])):
+                div.decompose()
+        
+        # Extract paragraphs
+        paragraphs = content_div.find_all('p')
+        if paragraphs:
+            text_parts = []
+            for p in paragraphs:
+                pt = p.get_text(strip=True)
+                if pt and not re.match(r'^Tips：|^传送门：|^哦豁，小伙伴们', pt):
+                    text_parts.append(pt)
+            text = '\n\n'.join(text_parts)
+        else:
+            text = content_div.get_text(separator='\n\n', strip=True)
+        
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        if len(text.strip()) < 20:
+            return None
+        return text
+    except Exception as e:
+        print(f"Error scraping 52shuku page: {e}")
+        return None
+
+def worker_52shuku(url, admin_email, metadata):
+    existing_chapters = check_existing_chapters(metadata['title'])
+    skip_meta = len(existing_chapters) > 0
+    
+    send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': [], 'skipMetadataUpdate': skip_meta})
+    
+    all_pages = fetch_page_list_52shuku(url)
+    if not all_pages:
+        print(f"No pages found for {metadata['title']}")
+        return
+    
+    print(f"Processing {len(all_pages)} pages from 52shuku.")
+    
+    batch = []
+    for page in all_pages:
+        if page['number'] in existing_chapters:
+            continue
+        
+        print(f"Scraping 52shuku: Page {page['number']}...")
+        content = scrape_page_52shuku(page['url'])
+        
+        if content:
+            batch.append({
+                'number': page['number'],
+                'title': page['title'],
+                'content': content
+            })
+            if len(batch) >= 5:
+                send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': batch, 'skipMetadataUpdate': True})
+                batch = []
+                time.sleep(1)
+    
+    if batch:
+        send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': batch, 'skipMetadataUpdate': True})
+
+# ==========================================
 # Main Orchestrator
 # ==========================================
 
@@ -1632,6 +1809,13 @@ def trigger_scrape():
             thread.start()
             return jsonify({'message': 'Scraping started (ErCiYuan - Chinese Site).'}), 200
 
+        elif '52shuku.net' in url:
+            meta = fetch_metadata_52shuku(url)
+            if not meta: return jsonify({'message': 'Failed metadata'}), 400
+            thread = threading.Thread(target=worker_52shuku, args=(url, admin_email, meta))
+            thread.start()
+            return jsonify({'message': 'Scraping started (52shuku).'}), 200
+
         else:
             return jsonify({'message': 'Unsupported Domain'}), 400
             
@@ -1674,6 +1858,9 @@ def perform_single_scrape(url, admin_email):
         elif 'erciyan.com' in url or '二次元' in url:
             meta = fetch_metadata_erciyuan(url)
             if meta: worker_erciyuan_list(url, admin_email, meta)
+        elif '52shuku.net' in url:
+            meta = fetch_metadata_52shuku(url)
+            if meta: worker_52shuku(url, admin_email, meta)
     except Exception as e:
         print(f"⚠️ Scheduler Error for {url}: {e}")
 
