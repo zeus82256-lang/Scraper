@@ -1710,6 +1710,236 @@ def worker_52shuku(url, admin_email, metadata):
         send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': batch, 'skipMetadataUpdate': True})
 
 # ==========================================
+# 🟢 9. 69shuba.com Logic
+# ==========================================
+
+def fetch_metadata_69shuba(url):
+    try:
+        # Extract articleid from URL (supports /txt/xxx/yyy or /book/xxx.htm or /book/xxx/)
+        articleid_match = re.search(r'/(?:txt|book)/(\d+)', url)
+        if not articleid_match:
+            return None
+        articleid = articleid_match.group(1)
+        
+        novel_main_url = f"https://www.69shuba.com/book/{articleid}.htm"
+        response = requests.get(novel_main_url, headers=get_headers(), timeout=15)
+        if response.status_code != 200:
+            return None
+        response.encoding = 'gbk'
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Title
+        title = ""
+        title_meta = soup.find("meta", property="og:title")
+        if title_meta:
+            title = title_meta["content"]
+        if not title:
+            h1 = soup.select_one('.booknav2 h1 a')
+            if h1:
+                title = h1.get_text(strip=True)
+        title = title.strip() if title else "Unknown Title"
+        
+        # Cover
+        cover = ""
+        cover_meta = soup.find("meta", property="og:image")
+        if cover_meta:
+            cover = cover_meta["content"]
+        if not cover:
+            img = soup.select_one('.bookimg2 img')
+            if img:
+                cover = img.get('src')
+                if cover and cover.startswith('//'):
+                    cover = 'https:' + cover
+                elif cover and cover.startswith('/'):
+                    cover = 'https://www.69shuba.com' + cover
+        
+        # Description
+        description = ""
+        desc_meta = soup.find("meta", property="og:description")
+        if desc_meta:
+            description = desc_meta["content"]
+        if not description:
+            desc_div = soup.select_one('.navtxt p')
+            if desc_div:
+                description = desc_div.get_text(strip=True)
+        
+        # Status
+        status = "مستمرة"
+        status_meta = soup.find("meta", property="og:novel:status")
+        if status_meta:
+            if '完结' in status_meta["content"]:
+                status = "مكتملة"
+        # Fallback: check text "连载" vs "完结"
+        if status == "مستمرة":
+            booknav_text = soup.select_one('.booknav2')
+            if booknav_text and ('完结' in booknav_text.get_text() or '完本' in booknav_text.get_text()):
+                status = "مكتملة"
+        
+        # Category
+        category = "عام"
+        cat_meta = soup.find("meta", property="og:novel:category")
+        if cat_meta:
+            category = cat_meta["content"]
+        
+        # Tags
+        tags = []
+        # Try to extract from bookinfo JavaScript
+        scripts = soup.find_all('script')
+        for script in scripts:
+            if script.string and 'bookinfo' in script.string:
+                tag_match = re.search(r'tags\s*:\s*["\']([^"\']*)["\']', script.string)
+                if tag_match:
+                    tags_str = tag_match.group(1)
+                    tags = [t.strip() for t in tags_str.split('|') if t.strip()]
+                break
+        
+        # Last update
+        last_update = None
+        update_meta = soup.find("meta", property="og:novel:update_time")
+        if update_meta:
+            date_str = update_meta["content"]
+            try:
+                dt = datetime.strptime(date_str.strip(), '%Y-%m-%d')
+                last_update = dt.isoformat()
+            except:
+                pass
+        
+        return {
+            'title': title,
+            'description': description,
+            'cover': cover,
+            'status': status,
+            'category': category,
+            'tags': tags,
+            'sourceUrl': novel_main_url,
+            'lastUpdate': last_update
+        }
+    except Exception as e:
+        print(f"Error 69shuba metadata: {e}")
+        return None
+
+def fetch_chapter_list_69shuba(url):
+    chapters = []
+    try:
+        articleid_match = re.search(r'(\d+)', url)
+        if not articleid_match:
+            return chapters
+        articleid = articleid_match.group(1)
+        list_url = f"https://www.69shuba.com/book/{articleid}/"
+        response = requests.get(list_url, headers=get_headers(), timeout=15)
+        if response.status_code != 200:
+            return chapters
+        response.encoding = 'gbk'
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Find chapter items
+        catalog = soup.find('div', class_='catalog')
+        if not catalog:
+            return chapters
+        
+        li_items = catalog.select('ul li')
+        for li in li_items:
+            a = li.find('a')
+            if not a:
+                continue
+            href = a.get('href')
+            if not href:
+                continue
+            # Extract chapter number from data-num attribute
+            num_str = li.get('data-num')
+            if num_str:
+                try:
+                    number = int(num_str)
+                except:
+                    number = 0
+            else:
+                # Fallback: try to extract from text
+                num_match = re.search(r'第(\d+)章', a.get_text(strip=True))
+                number = int(num_match.group(1)) if num_match else 0
+            
+            full_url = urljoin('https://www.69shuba.com', href)
+            title = a.get_text(strip=True)  # Use the full text as title
+            if number > 0:
+                chapters.append({'number': number, 'url': full_url, 'title': title})
+        
+        chapters.sort(key=lambda x: x['number'])
+        return chapters
+    except Exception as e:
+        print(f"Error 69shuba chapter list: {e}")
+        return chapters
+
+def scrape_chapter_69shuba(url):
+    try:
+        response = requests.get(url, headers=get_headers(), timeout=15)
+        if response.status_code != 200:
+            return None
+        response.encoding = 'gbk'
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        content_div = soup.find('div', class_='txtnav')
+        if not content_div:
+            return None
+        
+        # Remove unwanted elements
+        for bad in content_div.find_all(['script', 'style', 'ins', 'iframe']):
+            bad.decompose()
+        for div in content_div.find_all('div', class_=['txtinfo', 'txtright', 'contentadv', 'bottom-ad', 'page1', 'tools']):
+            div.decompose()
+        # Also remove the heading h1 inside txtnav if present (chapter title)
+        h1 = content_div.find('h1')
+        if h1:
+            h1.decompose()
+        
+        # Get text
+        text = content_div.get_text(separator='\n', strip=True)
+        # Clean up multiple blank lines
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        text = '\n'.join(lines)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        if len(text) < 50:
+            return None
+        return text
+    except Exception as e:
+        print(f"Error scraping 69shuba chapter: {e}")
+        return None
+
+def worker_69shuba(url, admin_email, metadata):
+    existing_chapters = check_existing_chapters(metadata['title'])
+    skip_meta = len(existing_chapters) > 0
+    
+    send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': [], 'skipMetadataUpdate': skip_meta})
+    
+    all_chapters = fetch_chapter_list_69shuba(url)
+    if not all_chapters:
+        print(f"No chapters found for {metadata['title']}")
+        return
+    
+    print(f"Processing {len(all_chapters)} chapters from 69shuba.")
+    
+    batch = []
+    for chap in all_chapters:
+        if chap['number'] in existing_chapters:
+            continue
+        
+        print(f"Scraping 69shuba: Ch {chap['number']}...")
+        content = scrape_chapter_69shuba(chap['url'])
+        
+        if content:
+            batch.append({
+                'number': chap['number'],
+                'title': chap['title'],
+                'content': content
+            })
+            if len(batch) >= 5:
+                send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': batch, 'skipMetadataUpdate': True})
+                batch = []
+                time.sleep(1)
+    
+    if batch:
+        send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': batch, 'skipMetadataUpdate': True})
+
+# ==========================================
 # Main Orchestrator
 # ==========================================
 
@@ -1816,6 +2046,13 @@ def trigger_scrape():
             thread.start()
             return jsonify({'message': 'Scraping started (52shuku).'}), 200
 
+        elif '69shuba.com' in url:
+            meta = fetch_metadata_69shuba(url)
+            if not meta: return jsonify({'message': 'Failed metadata'}), 400
+            thread = threading.Thread(target=worker_69shuba, args=(url, admin_email, meta))
+            thread.start()
+            return jsonify({'message': 'Scraping started (69shuba).'}), 200
+
         else:
             return jsonify({'message': 'Unsupported Domain'}), 400
             
@@ -1861,6 +2098,9 @@ def perform_single_scrape(url, admin_email):
         elif '52shuku.net' in url:
             meta = fetch_metadata_52shuku(url)
             if meta: worker_52shuku(url, admin_email, meta)
+        elif '69shuba.com' in url:
+            meta = fetch_metadata_69shuba(url)
+            if meta: worker_69shuba(url, admin_email, meta)
     except Exception as e:
         print(f"⚠️ Scheduler Error for {url}: {e}")
 
@@ -1909,3 +2149,18 @@ scheduler_thread.start()
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, threaded=True)
+
+# ==========================================
+# 🌐 جميع المواقع المدعومة وروابطها:
+# ==========================================
+# 1. Rewayat Club        - https://rewayat.club
+# 2. Ar-Novel            - https://ar-no.com
+# 3. Markaz Riwayat      - https://markazriwayat.com
+# 4. Novel Fire          - https://novelfire.net
+# 5. WuxiaBox/Spot       - https://wuxiabox.com / https://wuxiaspot.com
+# 6. FreeWebNovel        - https://freewebnovel.com
+# 7. FanMTL              - https://fanmtl.com
+# 8. ErCiYuan            - https://erciyan.com
+# 9. 52shuku             - https://www.52shuku.net
+# 10. 69shuba            - https://www.69shuba.com
+# ==========================================
