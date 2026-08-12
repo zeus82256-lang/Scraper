@@ -1710,99 +1710,165 @@ def worker_52shuku(url, admin_email, metadata):
         send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': batch, 'skipMetadataUpdate': True})
 
 # ==========================================
-# 🟢 9. 69shuba.com Logic
+# 🟢 9. Roliascan.com Logic
 # ==========================================
 
-def fetch_metadata_69shuba(url):
+def fetch_metadata_roliascan(url):
     try:
-        # Extract articleid from URL (supports /txt/xxx/yyy or /book/xxx.htm or /book/xxx/)
-        articleid_match = re.search(r'/(?:txt|book)/(\d+)', url)
-        if not articleid_match:
-            return None
-        articleid = articleid_match.group(1)
+        # If it's a chapter URL, extract the series slug
+        slug = None
+        if '/read/' in url:
+            # e.g., https://roliascan.com/read/slug/ch1-12345/
+            match = re.search(r'/read/([^/]+)/', url)
+            if match:
+                slug = match.group(1)
+            else:
+                # Fallback: take the last path component
+                parsed = urlparse(url)
+                path_parts = parsed.path.strip('/').split('/')
+                if 'read' in path_parts:
+                    idx = path_parts.index('read')
+                    if idx + 1 < len(path_parts):
+                        slug = path_parts[idx + 1]
+        elif '/manga/' in url:
+            # e.g., https://roliascan.com/manga/slug/
+            match = re.search(r'/manga/([^/]+)/?$', url)
+            if match:
+                slug = match.group(1)
         
-        novel_main_url = f"https://www.69shuba.com/book/{articleid}.htm"
-        response = requests.get(novel_main_url, headers=get_headers(), timeout=15)
+        if not slug:
+            # Last resort: try to extract from any path
+            parsed = urlparse(url)
+            path_parts = parsed.path.strip('/').split('/')
+            slug = path_parts[-1] if path_parts[-1] else path_parts[-2]
+        
+        # Build the manga info page URL
+        info_url = f"https://roliascan.com/manga/{slug}/"
+        
+        response = requests.get(info_url, headers=get_headers(), timeout=15)
         if response.status_code != 200:
             return None
-        response.encoding = 'gbk'
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(response.content, 'html.parser')
         
         # Title
         title = ""
-        title_meta = soup.find("meta", property="og:title")
-        if title_meta:
-            title = title_meta["content"]
+        og_title = soup.find("meta", property="og:title")
+        if og_title:
+            title = og_title["content"].replace(" Novel | Read Online Free at roliascan.com", "").strip()
         if not title:
-            h1 = soup.select_one('.booknav2 h1 a')
-            if h1:
-                title = h1.get_text(strip=True)
-        title = title.strip() if title else "Unknown Title"
+            title_tag = soup.select_one('.booknav2 h1 a, h1')
+            if title_tag:
+                title = title_tag.get_text(strip=True)
+        if not title:
+            title = "Unknown Title"
         
         # Cover
         cover = ""
-        cover_meta = soup.find("meta", property="og:image")
-        if cover_meta:
-            cover = cover_meta["content"]
+        og_image = soup.find("meta", property="og:image")
+        if og_image:
+            cover = og_image["content"]
         if not cover:
-            img = soup.select_one('.bookimg2 img')
+            img = soup.select_one('.bookimg2 img, .manga-cover-wrap img')
             if img:
-                cover = img.get('src')
-                if cover and cover.startswith('//'):
-                    cover = 'https:' + cover
-                elif cover and cover.startswith('/'):
-                    cover = 'https://www.69shuba.com' + cover
+                cover = img.get('src') or img.get('data-src')
+                if cover:
+                    if cover.startswith('//'):
+                        cover = 'https:' + cover
+                    elif cover.startswith('/'):
+                        cover = 'https://roliascan.com' + cover
         
         # Description
         description = ""
-        desc_meta = soup.find("meta", property="og:description")
-        if desc_meta:
-            description = desc_meta["content"]
+        og_desc = soup.find("meta", property="og:description")
+        if og_desc:
+            description = og_desc["content"]
         if not description:
-            desc_div = soup.select_one('.navtxt p')
+            desc_div = soup.select_one('.navtxt p, .description-summary')
             if desc_div:
                 description = desc_div.get_text(strip=True)
         
         # Status
         status = "مستمرة"
-        status_meta = soup.find("meta", property="og:novel:status")
-        if status_meta:
-            if '完结' in status_meta["content"]:
-                status = "مكتملة"
-        # Fallback: check text "连载" vs "完结"
+        # Check JSON-LD first
+        json_ld = soup.find("script", type="application/ld+json")
+        if json_ld:
+            try:
+                import json
+                data = json.loads(json_ld.string)
+                if isinstance(data, list):
+                    for item in data:
+                        if 'status' in item:
+                            if 'completed' in item['status'].lower():
+                                status = "مكتملة"
+                            break
+            except:
+                pass
+        # Fallback to text
         if status == "مستمرة":
             booknav_text = soup.select_one('.booknav2')
-            if booknav_text and ('完结' in booknav_text.get_text() or '完本' in booknav_text.get_text()):
+            if booknav_text and ('completed' in booknav_text.get_text().lower() or 'مكتملة' in booknav_text.get_text().lower()):
+                status = "مكتملة"
+        # Check for 'Ongoing' in text
+        if status == "مستمرة":
+            status_tag = soup.select_one('.capitalize')
+            if status_tag and 'ongoing' in status_tag.get_text().lower():
+                status = "مستمرة"
+            elif status_tag and 'completed' in status_tag.get_text().lower():
                 status = "مكتملة"
         
-        # Category
-        category = "عام"
-        cat_meta = soup.find("meta", property="og:novel:category")
-        if cat_meta:
-            category = cat_meta["content"]
-        
-        # Tags
+        # Category and tags
+        category = "Novel"  # default, but we'll try to detect
         tags = []
-        # Try to extract from bookinfo JavaScript
-        scripts = soup.find_all('script')
-        for script in scripts:
-            if script.string and 'bookinfo' in script.string:
-                tag_match = re.search(r'tags\s*:\s*["\']([^"\']*)["\']', script.string)
-                if tag_match:
-                    tags_str = tag_match.group(1)
-                    tags = [t.strip() for t in tags_str.split('|') if t.strip()]
-                break
+        # Extract from tag links
+        tag_links = soup.select('.flex-wrap a[href*="/tag/"]')
+        for link in tag_links:
+            tags.append(link.get_text(strip=True))
+        if not tags:
+            # Try from manga info page
+            tag_links = soup.select('.infotag a')
+            for link in tag_links:
+                tags.append(link.get_text(strip=True))
+        if tags:
+            category = tags[0] if tags else "عام"
+        
+        # Author
+        author_tag = soup.select_one('.booknav2 p a[href*="author"]')
+        if author_tag:
+            author = author_tag.get_text(strip=True)
+            # Not used directly in metadata but can be added as note if needed
         
         # Last update
         last_update = None
-        update_meta = soup.find("meta", property="og:novel:update_time")
-        if update_meta:
-            date_str = update_meta["content"]
-            try:
-                dt = datetime.strptime(date_str.strip(), '%Y-%m-%d')
-                last_update = dt.isoformat()
-            except:
-                pass
+        # Look for time tags or relative text
+        time_meta = soup.find("meta", property="og:novel:update_time")
+        if time_meta:
+            last_update = parse_relative_date(time_meta["content"])
+        if not last_update:
+            update_text = soup.select_one('.booknav2 p')
+            if update_text:
+                text = update_text.get_text()
+                # Try "Updated: 2026-04-16" pattern
+                match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
+                if match:
+                    last_update = parse_relative_date(match.group(1))
+                else:
+                    # Try relative "3 months ago"
+                    match = re.search(r'(\d+)\s+(month|day|week|hour|min|sec|second)s?\s+ago', text, re.IGNORECASE)
+                    if match:
+                        last_update = parse_relative_date(match.group(0))
+        if not last_update:
+            # Look for any datetime in JSON-LD
+            if json_ld:
+                try:
+                    import json
+                    data = json.loads(json_ld.string)
+                    if isinstance(data, list):
+                        for item in data:
+                            if 'dateModified' in item:
+                                last_update = parse_relative_date(item['dateModified'])
+                                if last_update: break
+                except:
+                    pass
         
         return {
             'title': title,
@@ -1811,88 +1877,96 @@ def fetch_metadata_69shuba(url):
             'status': status,
             'category': category,
             'tags': tags,
-            'sourceUrl': novel_main_url,
+            'sourceUrl': info_url,  # Use manga page as source
             'lastUpdate': last_update
         }
     except Exception as e:
-        print(f"Error 69shuba metadata: {e}")
+        print(f"Error roliascan metadata: {e}")
         return None
 
-def fetch_chapter_list_69shuba(url):
+def fetch_chapter_list_roliascan(url):
     chapters = []
     try:
-        articleid_match = re.search(r'(\d+)', url)
-        if not articleid_match:
-            return chapters
-        articleid = articleid_match.group(1)
-        list_url = f"https://www.69shuba.com/book/{articleid}/"
-        response = requests.get(list_url, headers=get_headers(), timeout=15)
+        # Use a chapter URL to get the chapter list. If the input is already a chapter URL, use it directly.
+        # Otherwise, we need a chapter URL. Extract from input if it's a chapter, else construct from slug.
+        if '/read/' in url:
+            chapter_url = url
+        else:
+            # If we only have the manga page, we need to get one chapter page to find the list.
+            # We'll attempt to get the first chapter by visiting the manga page and finding the "Read" link.
+            response = requests.get(url, headers=get_headers(), timeout=15)
+            if response.status_code != 200:
+                return chapters
+            soup = BeautifulSoup(response.content, 'html.parser')
+            read_link = soup.select_one('a[href*="/read/"]')
+            if read_link:
+                chapter_url = urljoin('https://roliascan.com', read_link['href'])
+            else:
+                return chapters
+        
+        # Fetch the chapter page
+        response = requests.get(chapter_url, headers=get_headers(), timeout=15)
         if response.status_code != 200:
             return chapters
-        response.encoding = 'gbk'
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Find chapter items
-        catalog = soup.find('div', class_='catalog')
-        if not catalog:
+        # Find the chapter select dropdown
+        select_elem = soup.find('select', id='chapter-select')
+        if not select_elem:
             return chapters
         
-        li_items = catalog.select('ul li')
-        for li in li_items:
-            a = li.find('a')
-            if not a:
+        options = select_elem.find_all('option')
+        for option in options:
+            value = option.get('value')
+            if not value:
                 continue
-            href = a.get('href')
-            if not href:
-                continue
-            # Extract chapter number from data-num attribute
-            num_str = li.get('data-num')
-            if num_str:
-                try:
-                    number = int(num_str)
-                except:
-                    number = 0
-            else:
-                # Fallback: try to extract from text
-                num_match = re.search(r'第(\d+)章', a.get_text(strip=True))
-                number = int(num_match.group(1)) if num_match else 0
-            
-            full_url = urljoin('https://www.69shuba.com', href)
-            title = a.get_text(strip=True)  # Use the full text as title
+            full_url = urljoin('https://roliascan.com', value)
+            text = option.get_text(strip=True)
+            # Extract chapter number from text like "Ch. 123"
+            num_match = re.search(r'Ch\.\s*(\d+)', text, re.IGNORECASE)
+            number = int(num_match.group(1)) if num_match else 0
+            if number == 0:
+                # Try from URL
+                match = re.search(r'ch(\d+)', value, re.IGNORECASE)
+                if match:
+                    number = int(match.group(1))
             if number > 0:
-                chapters.append({'number': number, 'url': full_url, 'title': title})
+                chapters.append({
+                    'number': number,
+                    'url': full_url,
+                    'title': text.strip()
+                })
         
         chapters.sort(key=lambda x: x['number'])
         return chapters
     except Exception as e:
-        print(f"Error 69shuba chapter list: {e}")
+        print(f"Error roliascan chapter list: {e}")
         return chapters
 
-def scrape_chapter_69shuba(url):
+def scrape_chapter_roliascan(url):
     try:
         response = requests.get(url, headers=get_headers(), timeout=15)
         if response.status_code != 200:
             return None
-        response.encoding = 'gbk'
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(response.content, 'html.parser')
         
-        content_div = soup.find('div', class_='txtnav')
+        # Try multiple selectors for content
+        content_div = soup.select_one('.reader-text') or soup.select_one('.entry-content') or soup.select_one('.chapter-content')
+        if not content_div:
+            # Fallback to the main article
+            content_div = soup.find('article')
         if not content_div:
             return None
         
         # Remove unwanted elements
-        for bad in content_div.find_all(['script', 'style', 'ins', 'iframe']):
+        for bad in content_div.find_all(['script', 'style', 'ins', 'iframe', 'button']):
             bad.decompose()
-        for div in content_div.find_all('div', class_=['txtinfo', 'txtright', 'contentadv', 'bottom-ad', 'page1', 'tools']):
-            div.decompose()
-        # Also remove the heading h1 inside txtnav if present (chapter title)
-        h1 = content_div.find('h1')
-        if h1:
-            h1.decompose()
+        # Remove ads containers
+        for ad in content_div.select('.ad-container, .code-block, .adsbygoogle, .rolia-ad-slot, .bottom-ad'):
+            ad.decompose()
         
         # Get text
         text = content_div.get_text(separator='\n', strip=True)
-        # Clean up multiple blank lines
         lines = [line.strip() for line in text.split('\n') if line.strip()]
         text = '\n'.join(lines)
         text = re.sub(r'\n{3,}', '\n\n', text)
@@ -1901,29 +1975,29 @@ def scrape_chapter_69shuba(url):
             return None
         return text
     except Exception as e:
-        print(f"Error scraping 69shuba chapter: {e}")
+        print(f"Error scraping roliascan chapter: {e}")
         return None
 
-def worker_69shuba(url, admin_email, metadata):
+def worker_roliascan(url, admin_email, metadata):
     existing_chapters = check_existing_chapters(metadata['title'])
     skip_meta = len(existing_chapters) > 0
     
     send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': [], 'skipMetadataUpdate': skip_meta})
     
-    all_chapters = fetch_chapter_list_69shuba(url)
+    all_chapters = fetch_chapter_list_roliascan(url)
     if not all_chapters:
         print(f"No chapters found for {metadata['title']}")
         return
     
-    print(f"Processing {len(all_chapters)} chapters from 69shuba.")
+    print(f"Processing {len(all_chapters)} chapters from roliascan.")
     
     batch = []
     for chap in all_chapters:
         if chap['number'] in existing_chapters:
             continue
         
-        print(f"Scraping 69shuba: Ch {chap['number']}...")
-        content = scrape_chapter_69shuba(chap['url'])
+        print(f"Scraping roliascan: Ch {chap['number']}...")
+        content = scrape_chapter_roliascan(chap['url'])
         
         if content:
             batch.append({
@@ -2046,12 +2120,12 @@ def trigger_scrape():
             thread.start()
             return jsonify({'message': 'Scraping started (52shuku).'}), 200
 
-        elif '69shuba.com' in url:
-            meta = fetch_metadata_69shuba(url)
+        elif 'roliascan.com' in url:
+            meta = fetch_metadata_roliascan(url)
             if not meta: return jsonify({'message': 'Failed metadata'}), 400
-            thread = threading.Thread(target=worker_69shuba, args=(url, admin_email, meta))
+            thread = threading.Thread(target=worker_roliascan, args=(url, admin_email, meta))
             thread.start()
-            return jsonify({'message': 'Scraping started (69shuba).'}), 200
+            return jsonify({'message': 'Scraping started (Roliascan).'}), 200
 
         else:
             return jsonify({'message': 'Unsupported Domain'}), 400
@@ -2098,9 +2172,9 @@ def perform_single_scrape(url, admin_email):
         elif '52shuku.net' in url:
             meta = fetch_metadata_52shuku(url)
             if meta: worker_52shuku(url, admin_email, meta)
-        elif '69shuba.com' in url:
-            meta = fetch_metadata_69shuba(url)
-            if meta: worker_69shuba(url, admin_email, meta)
+        elif 'roliascan.com' in url:
+            meta = fetch_metadata_roliascan(url)
+            if meta: worker_roliascan(url, admin_email, meta)
     except Exception as e:
         print(f"⚠️ Scheduler Error for {url}: {e}")
 
@@ -2162,5 +2236,5 @@ if __name__ == "__main__":
 # 7. FanMTL              - https://fanmtl.com
 # 8. ErCiYuan            - https://erciyan.com
 # 9. 52shuku             - https://www.52shuku.net
-# 10. 69shuba            - https://www.69shuba.com
+# 10. Roliascan          - https://roliascan.com
 # ==========================================
