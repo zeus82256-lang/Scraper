@@ -1710,41 +1710,27 @@ def worker_52shuku(url, admin_email, metadata):
         send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': batch, 'skipMetadataUpdate': True})
 
 # ==========================================
-# 🟢 9. Roliascan.com Logic
+# 🟢 9. Roliascan.com Logic (Updated)
 # ==========================================
 
 def fetch_metadata_roliascan(url):
     try:
-        # If it's a chapter URL, extract the series slug
         slug = None
         if '/read/' in url:
-            # e.g., https://roliascan.com/read/slug/ch1-12345/
             match = re.search(r'/read/([^/]+)/', url)
             if match:
                 slug = match.group(1)
-            else:
-                # Fallback: take the last path component
-                parsed = urlparse(url)
-                path_parts = parsed.path.strip('/').split('/')
-                if 'read' in path_parts:
-                    idx = path_parts.index('read')
-                    if idx + 1 < len(path_parts):
-                        slug = path_parts[idx + 1]
         elif '/manga/' in url:
-            # e.g., https://roliascan.com/manga/slug/
             match = re.search(r'/manga/([^/]+)/?$', url)
             if match:
                 slug = match.group(1)
         
         if not slug:
-            # Last resort: try to extract from any path
             parsed = urlparse(url)
             path_parts = parsed.path.strip('/').split('/')
             slug = path_parts[-1] if path_parts[-1] else path_parts[-2]
         
-        # Build the manga info page URL
         info_url = f"https://roliascan.com/manga/{slug}/"
-        
         response = requests.get(info_url, headers=get_headers(), timeout=15)
         if response.status_code != 200:
             return None
@@ -1754,7 +1740,7 @@ def fetch_metadata_roliascan(url):
         title = ""
         og_title = soup.find("meta", property="og:title")
         if og_title:
-            title = og_title["content"].replace(" Novel | Read Online Free at roliascan.com", "").strip()
+            title = og_title["content"].replace(" Novel | Read Online Free at roliascan.com", "").replace(" Manga | Read Online Free at roliascan.com", "").strip()
         if not title:
             title_tag = soup.select_one('.booknav2 h1 a, h1')
             if title_tag:
@@ -1789,7 +1775,6 @@ def fetch_metadata_roliascan(url):
         
         # Status
         status = "مستمرة"
-        # Check JSON-LD first
         json_ld = soup.find("script", type="application/ld+json")
         if json_ld:
             try:
@@ -1803,12 +1788,10 @@ def fetch_metadata_roliascan(url):
                             break
             except:
                 pass
-        # Fallback to text
         if status == "مستمرة":
             booknav_text = soup.select_one('.booknav2')
             if booknav_text and ('completed' in booknav_text.get_text().lower() or 'مكتملة' in booknav_text.get_text().lower()):
                 status = "مكتملة"
-        # Check for 'Ongoing' in text
         if status == "مستمرة":
             status_tag = soup.select_one('.capitalize')
             if status_tag and 'ongoing' in status_tag.get_text().lower():
@@ -1817,29 +1800,20 @@ def fetch_metadata_roliascan(url):
                 status = "مكتملة"
         
         # Category and tags
-        category = "Novel"  # default, but we'll try to detect
+        category = "Novel"
         tags = []
-        # Extract from tag links
         tag_links = soup.select('.flex-wrap a[href*="/tag/"]')
         for link in tag_links:
             tags.append(link.get_text(strip=True))
         if not tags:
-            # Try from manga info page
             tag_links = soup.select('.infotag a')
             for link in tag_links:
                 tags.append(link.get_text(strip=True))
         if tags:
             category = tags[0] if tags else "عام"
         
-        # Author
-        author_tag = soup.select_one('.booknav2 p a[href*="author"]')
-        if author_tag:
-            author = author_tag.get_text(strip=True)
-            # Not used directly in metadata but can be added as note if needed
-        
         # Last update
         last_update = None
-        # Look for time tags or relative text
         time_meta = soup.find("meta", property="og:novel:update_time")
         if time_meta:
             last_update = parse_relative_date(time_meta["content"])
@@ -1847,28 +1821,24 @@ def fetch_metadata_roliascan(url):
             update_text = soup.select_one('.booknav2 p')
             if update_text:
                 text = update_text.get_text()
-                # Try "Updated: 2026-04-16" pattern
                 match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
                 if match:
                     last_update = parse_relative_date(match.group(1))
                 else:
-                    # Try relative "3 months ago"
                     match = re.search(r'(\d+)\s+(month|day|week|hour|min|sec|second)s?\s+ago', text, re.IGNORECASE)
                     if match:
                         last_update = parse_relative_date(match.group(0))
-        if not last_update:
-            # Look for any datetime in JSON-LD
-            if json_ld:
-                try:
-                    import json
-                    data = json.loads(json_ld.string)
-                    if isinstance(data, list):
-                        for item in data:
-                            if 'dateModified' in item:
-                                last_update = parse_relative_date(item['dateModified'])
-                                if last_update: break
-                except:
-                    pass
+        if not last_update and json_ld:
+            try:
+                import json
+                data = json.loads(json_ld.string)
+                if isinstance(data, list):
+                    for item in data:
+                        if 'dateModified' in item:
+                            last_update = parse_relative_date(item['dateModified'])
+                            if last_update: break
+            except:
+                pass
         
         return {
             'title': title,
@@ -1877,7 +1847,7 @@ def fetch_metadata_roliascan(url):
             'status': status,
             'category': category,
             'tags': tags,
-            'sourceUrl': info_url,  # Use manga page as source
+            'sourceUrl': info_url,
             'lastUpdate': last_update
         }
     except Exception as e:
@@ -1887,13 +1857,42 @@ def fetch_metadata_roliascan(url):
 def fetch_chapter_list_roliascan(url):
     chapters = []
     try:
-        # Use a chapter URL to get the chapter list. If the input is already a chapter URL, use it directly.
-        # Otherwise, we need a chapter URL. Extract from input if it's a chapter, else construct from slug.
+        # If the URL is a manga info page, try to extract chapters from the inline chapter list
+        if '/manga/' in url and '/read/' not in url:
+            response = requests.get(url, headers=get_headers(), timeout=15)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                # Find chapter-list container
+                chapter_list = soup.select_one('.chapter-list')
+                if chapter_list:
+                    for a in chapter_list.find_all('a', href=re.compile(r'/read/')):
+                        href = a['href']
+                        full_url = urljoin('https://roliascan.com', href)
+                        text = a.get_text(strip=True)
+                        # Extract number from "Ch. X" or from href ch1-...
+                        num_match = re.search(r'Ch\.\s*(\d+)', text)
+                        if num_match:
+                            number = int(num_match.group(1))
+                        else:
+                            # Try from URL
+                            match = re.search(r'ch(\d+)-', href)
+                            if match:
+                                number = int(match.group(1))
+                            else:
+                                number = 0
+                        if number > 0:
+                            # Try to get title text from the element structure (some have span "Ch. X")
+                            title = text.strip()
+                            chapters.append({'number': number, 'url': full_url, 'title': title})
+                    if chapters:
+                        chapters.sort(key=lambda x: x['number'])
+                        return chapters
+        
+        # Fallback: try to get chapters from a chapter page's select element
         if '/read/' in url:
             chapter_url = url
         else:
-            # If we only have the manga page, we need to get one chapter page to find the list.
-            # We'll attempt to get the first chapter by visiting the manga page and finding the "Read" link.
+            # Get any chapter page from the manga page
             response = requests.get(url, headers=get_headers(), timeout=15)
             if response.status_code != 200:
                 return chapters
@@ -1904,13 +1903,10 @@ def fetch_chapter_list_roliascan(url):
             else:
                 return chapters
         
-        # Fetch the chapter page
         response = requests.get(chapter_url, headers=get_headers(), timeout=15)
         if response.status_code != 200:
             return chapters
         soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Find the chapter select dropdown
         select_elem = soup.find('select', id='chapter-select')
         if not select_elem:
             return chapters
@@ -1922,20 +1918,14 @@ def fetch_chapter_list_roliascan(url):
                 continue
             full_url = urljoin('https://roliascan.com', value)
             text = option.get_text(strip=True)
-            # Extract chapter number from text like "Ch. 123"
             num_match = re.search(r'Ch\.\s*(\d+)', text, re.IGNORECASE)
             number = int(num_match.group(1)) if num_match else 0
             if number == 0:
-                # Try from URL
                 match = re.search(r'ch(\d+)', value, re.IGNORECASE)
                 if match:
                     number = int(match.group(1))
             if number > 0:
-                chapters.append({
-                    'number': number,
-                    'url': full_url,
-                    'title': text.strip()
-                })
+                chapters.append({'number': number, 'url': full_url, 'title': text.strip()})
         
         chapters.sort(key=lambda x: x['number'])
         return chapters
@@ -1950,22 +1940,25 @@ def scrape_chapter_roliascan(url):
             return None
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Try multiple selectors for content
-        content_div = soup.select_one('.reader-text') or soup.select_one('.entry-content') or soup.select_one('.chapter-content')
+        # Extended selectors for content
+        content_div = soup.select_one('.reader-text, .entry-content, .chapter-content, #content, .reading-content')
         if not content_div:
-            # Fallback to the main article
             content_div = soup.find('article')
+        if not content_div:
+            # If still not found, try any div that contains paragraphs
+            for div in soup.find_all('div'):
+                if div.find('p') and len(div.get_text(strip=True)) > 200:
+                    content_div = div
+                    break
         if not content_div:
             return None
         
         # Remove unwanted elements
         for bad in content_div.find_all(['script', 'style', 'ins', 'iframe', 'button']):
             bad.decompose()
-        # Remove ads containers
         for ad in content_div.select('.ad-container, .code-block, .adsbygoogle, .rolia-ad-slot, .bottom-ad'):
             ad.decompose()
         
-        # Get text
         text = content_div.get_text(separator='\n', strip=True)
         lines = [line.strip() for line in text.split('\n') if line.strip()]
         text = '\n'.join(lines)
