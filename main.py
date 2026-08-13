@@ -2007,6 +2007,214 @@ def worker_roliascan(url, admin_email, metadata):
         send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': batch, 'skipMetadataUpdate': True})
 
 # ==========================================
+# 🔵 10. Quanben.io Logic
+# ==========================================
+
+def fetch_metadata_quanben(url):
+    try:
+        # If given chapter URL, convert to book info page
+        if '/n/' in url:
+            match = re.search(r'/n/([^/]+)/', url)
+            if match:
+                slug = match.group(1)
+            else:
+                parsed = urlparse(url)
+                path_parts = parsed.path.strip('/').split('/')
+                if 'n' in path_parts:
+                    idx = path_parts.index('n')
+                    if idx + 1 < len(path_parts):
+                        slug = path_parts[idx + 1]
+                else:
+                    return None
+            info_url = f"https://www.quanben.io/n/{slug}/"
+        else:
+            info_url = url
+        
+        response = requests.get(info_url, headers=get_headers(), timeout=15)
+        if response.status_code != 200:
+            return None
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Title
+        title = ""
+        h1 = soup.find('h1')
+        if h1:
+            title = h1.get_text(strip=True)
+        if not title:
+            title_span = soup.select_one('.list2 h3 span')
+            if title_span:
+                title = title_span.get_text(strip=True)
+        if not title:
+            title = "Unknown Title"
+        
+        # Cover
+        cover = ""
+        img = soup.select_one('.list2 img')
+        if img:
+            cover = img.get('src')
+            if cover:
+                if cover.startswith('//'):
+                    cover = 'https:' + cover
+                elif cover.startswith('/'):
+                    cover = 'https://www.quanben.io' + cover
+        
+        # Description
+        description = ""
+        desc_p = soup.select_one('.description p')
+        if desc_p:
+            description = desc_p.get_text(strip=True)
+        else:
+            meta_desc = soup.find("meta", attrs={"name": "description"})
+            if meta_desc:
+                description = meta_desc.get("content", "")
+        
+        # Status
+        status = "مستمرة"
+        status_span = soup.select_one('.list2 p:contains("状态") span')
+        if status_span:
+            txt = status_span.get_text(strip=True)
+            if '完结' in txt or 'مكتملة' in txt:
+                status = "مكتملة"
+        if status == "مستمرة":
+            if '完结' in soup.get_text():
+                status = "مكتملة"
+        
+        # Category
+        category = "عام"
+        cat_span = soup.select_one('.list2 p:contains("类别") span')
+        if cat_span:
+            category = cat_span.get_text(strip=True)
+        
+        tags = []
+        
+        return {
+            'title': title,
+            'description': description,
+            'cover': cover,
+            'status': status,
+            'category': category,
+            'tags': tags,
+            'sourceUrl': info_url,
+            'lastUpdate': None
+        }
+    except Exception as e:
+        print(f"Error quanben metadata: {e}")
+        return None
+
+def fetch_chapter_list_quanben(url):
+    chapters = []
+    try:
+        if '/n/' in url and url.endswith('.html'):
+            list_url = url.rsplit('/', 1)[0] + '/list.html'
+        elif '/n/' in url and not url.endswith('/list.html'):
+            if url.endswith('/'):
+                list_url = url + 'list.html'
+            else:
+                list_url = url + '/list.html'
+        else:
+            list_url = url
+        
+        response = requests.get(list_url, headers=get_headers(), timeout=15)
+        if response.status_code != 200:
+            return chapters
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        links = soup.select('ul.list3 li a')
+        for a in links:
+            href = a.get('href')
+            if not href:
+                continue
+            full_url = urljoin('https://www.quanben.io', href)
+            text = a.get_text(strip=True)
+            num_match = re.search(r'/(\d+)\.html', href)
+            if not num_match:
+                num_match = re.search(r'第(\d+)章', text)
+            number = int(num_match.group(1)) if num_match else 0
+            if number > 0:
+                chapters.append({'number': number, 'url': full_url, 'title': text.strip()})
+        
+        if chapters:
+            max_num = max(c['number'] for c in chapters)
+            existing_nums = {c['number'] for c in chapters}
+            base_url = re.sub(r'\d+\.html$', '', chapters[0]['url'])
+            for i in range(1, max_num + 1):
+                if i not in existing_nums:
+                    missing_url = f"{base_url}{i}.html"
+                    chapters.append({'number': i, 'url': missing_url, 'title': f'第{i}章'})
+            chapters.sort(key=lambda x: x['number'])
+        
+        return chapters
+    except Exception as e:
+        print(f"Error quanben chapter list: {e}")
+        return chapters
+
+def scrape_chapter_quanben(url):
+    try:
+        response = requests.get(url, headers=get_headers(), timeout=15)
+        if response.status_code != 200:
+            return None
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        content_div = soup.find('div', id='content')
+        if not content_div:
+            return None
+        
+        for bad in content_div.find_all(['script', 'style', 'ins', 'iframe']):
+            bad.decompose()
+        
+        paragraphs = content_div.find_all('p')
+        if paragraphs:
+            text_parts = [p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True)]
+            text = '\n\n'.join(text_parts)
+        else:
+            text = content_div.get_text(separator='\n\n', strip=True)
+        
+        text = re.sub(r'<!--PAGE \d+-->', '', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        if len(text.strip()) < 50:
+            return None
+        return text
+    except Exception as e:
+        print(f"Error scraping quanben chapter: {e}")
+        return None
+
+def worker_quanben(url, admin_email, metadata):
+    existing_chapters = check_existing_chapters(metadata['title'])
+    skip_meta = len(existing_chapters) > 0
+    
+    send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': [], 'skipMetadataUpdate': skip_meta})
+    
+    all_chapters = fetch_chapter_list_quanben(url)
+    if not all_chapters:
+        print(f"No chapters found for {metadata['title']}")
+        return
+    
+    print(f"Processing {len(all_chapters)} chapters from quanben.")
+    
+    batch = []
+    for chap in all_chapters:
+        if chap['number'] in existing_chapters:
+            continue
+        
+        print(f"Scraping quanben: Ch {chap['number']}...")
+        content = scrape_chapter_quanben(chap['url'])
+        
+        if content:
+            batch.append({
+                'number': chap['number'],
+                'title': chap['title'],
+                'content': content
+            })
+            if len(batch) >= 5:
+                send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': batch, 'skipMetadataUpdate': True})
+                batch = []
+                time.sleep(1)
+    
+    if batch:
+        send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata, 'chapters': batch, 'skipMetadataUpdate': True})
+
+# ==========================================
 # Main Orchestrator
 # ==========================================
 
@@ -2120,6 +2328,13 @@ def trigger_scrape():
             thread.start()
             return jsonify({'message': 'Scraping started (Roliascan).'}), 200
 
+        elif 'quanben.io' in url:
+            meta = fetch_metadata_quanben(url)
+            if not meta: return jsonify({'message': 'Failed metadata'}), 400
+            thread = threading.Thread(target=worker_quanben, args=(url, admin_email, meta))
+            thread.start()
+            return jsonify({'message': 'Scraping started (Quanben).'}), 200
+
         else:
             return jsonify({'message': 'Unsupported Domain'}), 400
             
@@ -2168,6 +2383,9 @@ def perform_single_scrape(url, admin_email):
         elif 'roliascan.com' in url:
             meta = fetch_metadata_roliascan(url)
             if meta: worker_roliascan(url, admin_email, meta)
+        elif 'quanben.io' in url:
+            meta = fetch_metadata_quanben(url)
+            if meta: worker_quanben(url, admin_email, meta)
     except Exception as e:
         print(f"⚠️ Scheduler Error for {url}: {e}")
 
@@ -2230,4 +2448,5 @@ if __name__ == "__main__":
 # 8. ErCiYuan            - https://erciyan.com
 # 9. 52shuku             - https://www.52shuku.net
 # 10. Roliascan          - https://roliascan.com
+# 11. Quanben            - https://www.quanben.io
 # ==========================================
