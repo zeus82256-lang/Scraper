@@ -22,7 +22,7 @@ from urllib.parse import urljoin, urlparse
 
 from core.registry import register_site
 from core.utils import (
-    http_get, parse_html, get_headers, get_base_url, fix_image_url,
+    http_get, smart_get, parse_html, get_headers, get_base_url, fix_image_url,
     parse_relative_date, extract_chapter_number, clean_text, get_meta,
     UA_FIREFOX,
     generic_worker,
@@ -32,7 +32,8 @@ from core.utils import (
 # ==========================================
 # 🔵 1. Quanben.io (全本网)
 # ==========================================
-# ⚠️ الموقع يعمل لكنه يحجب IP مراكز البيانات (403 Apache).
+# ⚠️ الموقع يحجب IP مراكز البيانات (403 Apache) — نستخدم smart_get
+# (مباشر ثم بروكسي ترجمة جوجل تلقائياً — تم التحقق أنه يعمل).
 
 def fetch_metadata_quanben(url):
     try:
@@ -56,7 +57,7 @@ def fetch_metadata_quanben(url):
         else:
             info_url = url
 
-        response = http_get(info_url, timeout=15)
+        response = smart_get(info_url, sl='zh-CN', timeout=30)
         if response is None or response.status_code != 200:
             return None
         soup = parse_html(response)
@@ -123,7 +124,7 @@ def fetch_chapter_list_quanben(url):
         else:
             list_url = url
 
-        response = http_get(list_url, timeout=15)
+        response = smart_get(list_url, sl='zh-CN', timeout=30)
         if response is None or response.status_code != 200:
             return chapters
         soup = parse_html(response)
@@ -160,7 +161,7 @@ def fetch_chapter_list_quanben(url):
 
 def scrape_chapter_quanben(url):
     try:
-        response = http_get(url, timeout=15)
+        response = smart_get(url, sl='zh-CN', timeout=30)
         if response is None or response.status_code != 200:
             return None
         soup = parse_html(response)
@@ -363,14 +364,17 @@ def worker_52shuku(url, admin_email, metadata):
 # ==========================================
 # 🟤 3. ErCiYuan (二次元小说网 - erciyan.com)
 # ==========================================
-# ⚠️ الموقع يعمل لكن WAF يعرض كابتشا لعناوين مراكز البيانات.
+# ⚠️ الموقع يعرض WAF كابتشا لعناوين مراكز البيانات — نستخدم smart_get
+# (تم التحقق أن بروكسي الترجمة يجلب الصفحة الحقيقية بدون كابتشا).
+# ملاحظة: روابط الفصول في صفحة الكتاب تشير لموقع الشقيق 2cyxsw.net
+# لذلك مسجلان معاً بنفس الدوال.
 
 ZH_HEADERS_LANG = 'zh-CN,zh;q=0.9'
 
 
 def fetch_metadata_erciyuan(url):
     try:
-        response = http_get(url, timeout=15, lang=ZH_HEADERS_LANG)
+        response = smart_get(url, sl='zh-CN', lang=ZH_HEADERS_LANG, timeout=30)
         if response is None or response.status_code != 200:
             return None
         soup = parse_html(response)
@@ -424,35 +428,100 @@ def fetch_metadata_erciyuan(url):
         return None
 
 
+def _erciyuan_book_id(url):
+    m = re.search(r'/book/(\d+)', url)
+    return m.group(1) if m else None
+
+
+def _erciyuan_chapter_number(title, href):
+    """رقم الفصل: من العنوان (435:xxx / 第435章) ثم من الرابط كاحتياط"""
+    m = re.match(r'^\s*(\d+)\s*[:：.、]', title)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'第(\d+)[章回节]', title)
+    if m:
+        return int(m.group(1))
+    return extract_chapter_number(title, href)
+
+
 def fetch_chapter_list_erciyuan(url):
+    """
+    قائمة الفصول الكاملة عبر فهرس موقع الشقيق 2cyxsw.net:
+    - الفهرس: /book/{id}/{صفحة}/ (صفحات من select options)
+    - كل صفحة فيها روابط بصيغة /book/{id}/{chapterid}.html وعنوان "N:اسم الفصل"
+    """
     chapters = []
     try:
-        response = http_get(url, timeout=15, lang=ZH_HEADERS_LANG)
-        if response is None or response.status_code != 200:
-            return chapters
-        soup = parse_html(response)
+        book_id = _erciyuan_book_id(url)
+        if not book_id:
+            print("ErCiYuan: cannot extract book id")
+            return []
 
-        section_box = soup.select_one('div.section-box')
-        chapter_items = section_box.select('ul.section-list li a') if section_box else soup.select('ul.section-list li a')
+        tocs_seen = set()
+        page = 1
+        while page and page < 100:
+            toc_url = f'https://www.2cyxsw.net/book/{book_id}/{page}/'
+            if toc_url in tocs_seen:
+                break
+            tocs_seen.add(toc_url)
 
-        base_url = get_base_url(url)
+            response = smart_get(toc_url, sl='zh-CN', lang=ZH_HEADERS_LANG, timeout=30)
+            if response is None or response.status_code != 200:
+                break
+            soup = parse_html(response)
 
-        for a in chapter_items:
-            href = a.get('href')
-            if not href:
-                continue
-            full_url = urljoin(base_url, href)
-            raw_title = a.get_text(strip=True)
+            found = 0
+            next_page = None
+            for a in soup.select(f'a[href*="/book/{book_id}/"]'):
+                href = a.get('href') or ''
+                m = re.search(rf'/book/{book_id}/(\d+)\.html$', href)
+                if m:
+                    raw_title = a.get_text(strip=True)
+                    # تجاهل روابط التنقل الثابتة
+                    if raw_title in ('开始阅读', '直达底部', '加入书架', '投推荐票'):
+                        continue
+                    number = _erciyuan_chapter_number(raw_title, href)
+                    # تجاهل الأرقام غير المنطقية (مثل معرف الكتاب نفسه)
+                    if number > 0 and number != int(book_id):
+                        chapters.append({
+                            'number': number,
+                            'url': f'https://www.2cyxsw.net/book/{book_id}/{m.group(1)}.html',
+                            'title': raw_title,
+                        })
+                        found += 1
+                        continue
+                    # روابط ترقيم الفهرس: /book/{id}/{N}/
+                    m2 = re.search(rf'/book/{book_id}/(\d+)/$', href)
+                    if m2 and a.get_text(strip=True) in ('下一页', '下页', 'next', '下一頁'):
+                        next_page = max(next_page or 0, int(m2.group(1)))
 
-            num_match = re.search(r'第(\d+)章', raw_title)
-            number = int(num_match.group(1)) if num_match else extract_chapter_number(raw_title, href)
+            print(f"ErCiYuan TOC page {page}: {found} chapters")
 
-            clean_title = re.sub(r'^第\d+章\s*', '', raw_title).strip() or raw_title
+            # اكتشاف آخر صفحة فهرس من قائمة select
+            max_opt = 0
+            for option in soup.select('option'):
+                val = option.get('value') or ''
+                m3 = re.search(rf'/book/{book_id}/(\d+)/$', val)
+                if m3:
+                    max_opt = max(max_opt, int(m3.group(1)))
 
-            if number > 0:
-                chapters.append({'number': number, 'url': full_url, 'title': clean_title})
+            if next_page and next_page > page:
+                page = next_page
+            elif max_opt and page < max_opt:
+                page += 1
+            else:
+                break
+            time.sleep(0.5)
 
-        chapters.sort(key=lambda x: x['number'])
+        if not chapters:
+            return []
+
+        # إزالة التكرار بالرقم + ترتيب
+        dedup = {}
+        for c in chapters:
+            dedup.setdefault(c['number'], c)
+        chapters = sorted(dedup.values(), key=lambda x: x['number'])
+        print(f"✅ ErCiYuan chapters found: {len(chapters)}")
         return chapters
     except Exception as e:
         print(f"Error ErCiYuan chapter list: {e}")
@@ -461,7 +530,7 @@ def fetch_chapter_list_erciyuan(url):
 
 def scrape_chapter_erciyuan(url):
     try:
-        response = http_get(url, timeout=15, lang=ZH_HEADERS_LANG)
+        response = smart_get(url, sl='zh-CN', lang=ZH_HEADERS_LANG, timeout=30)
         if response is None or response.status_code != 200:
             return None
         soup = parse_html(response)
@@ -482,6 +551,11 @@ def scrape_chapter_erciyuan(url):
         text = re.sub(r'本章未完，点击下一页继续阅读', '', text)
         text = re.sub(r'请收藏本站：https?://\S+', '', text)
         text = re.sub(r'最新章节请.*', '', text, flags=re.IGNORECASE)
+        # تنظيف أسطر الإعلانات المتنقلة (完♂本♂神♂立占 وروابط m.xxx)
+        text = re.sub(r'[↘↙↑]\s*完[♂♀]本[♂♀]神[♂♀]立占\s*[↗↖↑↙↘]?', '', text)
+        text = re.sub(r'手机用户输入地址[:：]?\s*m\.\S+', '', text)
+        text = re.sub(r'天才一秒记住本站地址.*', '', text)
+        text = re.sub(r'\b(m|www)\.\w+\.(com|net|cc|org)\b.*', '', text)
         text = clean_text(text)
 
         return text if len(text.strip()) > 50 else None
@@ -1246,8 +1320,8 @@ register_site(
     fetch_chapters=fetch_chapter_list_quanben,
     fetch_content=scrape_chapter_quanben,
     worker=worker_quanben,
-    status='blocked',
-    notes='الموقع يعمل لكن يحجب IP مراكز البيانات (403). يعمل من Railway أو IP سكني.'
+    status='active',
+    notes='يعمل عبر التوجيه الذكي (بروكسي ترجمة جوجل) رغم حجب IP السيرفرات. قائمة الفصول في /n/{slug}/list.html.'
 )
 
 register_site(
@@ -1263,15 +1337,15 @@ register_site(
 )
 
 register_site(
-    domain_patterns=['erciyan.com'],
+    domain_patterns=['erciyan.com', '2cyxsw.net'],
     name='ErCiYuan (二次元小说网)',
     language='chinese',
     fetch_metadata=fetch_metadata_erciyuan,
     fetch_chapters=fetch_chapter_list_erciyuan,
     fetch_content=scrape_chapter_erciyuan,
     worker=worker_erciyuan,
-    status='blocked',
-    notes='الموقع يعمل لكن WAF يعرض كابتشا لعناوين مراكز البيانات. يعمل من IP سكني.'
+    status='active',
+    notes='WAF كابتشا من IP السيرفرات — يعمل عبر التوجيه الذكي. روابط الفصول تشير لموقع الشقيق 2cyxsw.net (مسجل أيضاً).'
 )
 
 register_site(

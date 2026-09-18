@@ -9,14 +9,17 @@
 - تحويل التواريخ النسبية
 - استخراج أرقام الفصول
 - مساعد قالب Madara العام (يستخدمه أكثر من موقع)
+- 🆕 التوجيه الذكي (smart_get): بديل تلقائي عند حجب IP السيرفر
 """
 
+import os
 import re
 import time
+import json
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, quote
 
 from .config import MARKAZ_COOKIES
 
@@ -26,6 +29,16 @@ from .config import MARKAZ_COOKIES
 UA_CHROME = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 UA_FIREFOX = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0'
 UA_MOBILE = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
+
+# ==========================================
+# 🆕 إعدادات التوجيه الذكي (متغيرات بيئة اختيارية)
+# ==========================================
+# FLARESOLVR_URL  : رابط خدمة FlareSolverr (مثال: http://flaresolverr:8191)
+# SCRAPERAPI_KEY  : مفتاح ScraperAPI المجاني (يُمرر الطلب عبر بروكسي سكني)
+# RESIDENTIAL_PROXY : بروكسي عام بصيغة http://user:pass@host:port
+FLARESOLVR_URL = os.environ.get('FLARESOLVR_URL', '').rstrip('/')
+SCRAPERAPI_KEY = os.environ.get('SCRAPERAPI_KEY', '')
+RESIDENTIAL_PROXY = os.environ.get('RESIDENTIAL_PROXY', '')
 
 
 def get_headers(referer=None, use_cookies=False, ua=None, lang='ar,en-US;q=0.7,en;q=0.3'):
@@ -61,6 +74,237 @@ def http_get(url, referer=None, use_cookies=False, ua=None, lang='ar,en-US;q=0.7
     except Exception as e:
         print(f"❌ GET failed {url[:80]}: {e}")
         return None
+
+
+# ==========================================
+# 🆕🛰️ التوجيه الذكي (Smart Routing)
+# ==========================================
+# المشكلة: مواقع كثيرة (FanMTL / RoyalRoad / WuxiaBox ...) تحجب عناوين IP
+# الخاصة بمراكز البيانات (Railway وأي سيرفر سحابي) بحماية Cloudflare،
+# فيفشل الطلب المباشر بـ 403/400 حتى لو كان الكود صحيحاً.
+#
+# الحل: smart_get يجرب عدة طرق بالترتيب ويحفظ الطريقة الناجحة لكل نطاق:
+#   1) الطلب المباشر (أسرع طريقة — تعمل مع معظم المواقع)
+#   2) عبر بروكسي ترجمة جوجل (translate.goog) — يجلب الصفحة من شبكة
+#      جوجل التي لا تُحجب، ويُعيد HTML الأصلي بدون ترجمة النص فعلياً
+#   3) عبر FlareSolverr إن ضُبط FLARESOLVR_URL (يحل تحديات Cloudflare)
+#   4) عبر ScraperAPI إن ضُبط SCRAPERAPI_KEY (بروكسي سكني مجاني جزئياً)
+# ==========================================
+
+# ذاكرة مؤقتة لطريقة الطلب الناجحة لكل نطاق (لتسريع سحب الفصول)
+_DOMAIN_ROUTE_CACHE = {}
+
+# علامات تدل على أن الرد "صفحة حجب/تحدي" وليس المحتوى الحقيقي
+_BLOCK_MARKERS = [
+    'just a moment', 'challenge-platform', '_cf_chl_opt', 'cf-chl-bypass',
+    'attention required', 'cf-browser-verification', 'checking your browser',
+    'verify yourself', 'ddos protection by', 'access denied |',
+    'cf-mitigated', 'captcha-form', 'enable javascript and cookies',
+]
+
+
+class SmartResponse:
+    """كائن استجابة موحّد (يحاكي requests.Response بما يكفي للسكرابر)"""
+
+    def __init__(self, text, status_code=200, route='direct'):
+        self.text = text
+        self.content = text.encode('utf-8', errors='replace') if isinstance(text, str) else text
+        self.status_code = status_code
+        self.route = route
+        self.headers = {}
+
+    def json(self):
+        return json.loads(self.text)
+
+
+def translate_proxy_url(url, sl='en', tl='es'):
+    """تحويل أي رابط إلى مكافئه عبر بروكسي ترجمة جوجل (translate.goog).
+    ملاحظة: المحتوى يُعاد بصيغته الأصلية (الترجمة تُحقن بجافاسكربت للمتصفح فقط)."""
+    p = urlparse(url)
+    dashed = p.netloc.replace('-', '--').replace('.', '-')
+    q = f'_x_tr_sl={sl}&_x_tr_tl={tl}&_x_tr_hl=en'
+    path = p.path or '/'
+    full = f"https://{dashed}.translate.goog{path}?{q}"
+    if p.query:
+        full += '&' + p.query
+    return full
+
+
+def _undash_host(dashed):
+    """عكس ترميز جوجل: النقاط أصبحت شرطات والشرطات الأصلية أصبحت شرطتين"""
+    s = dashed.replace('--', '\x00')
+    s = s.replace('-', '.')
+    return s.replace('\x00', '-')
+
+
+def _normalize_translate_html(html, base_url):
+    """إعادة كتابة كل روابط translate.goog داخل الصفحة إلى نطاقاتها الأصلية"""
+    if not html or 'translate.goog' not in html:
+        return html
+    p = urlparse(base_url)
+
+    # https://xxx-yyy.translate.goog/path?_x_tr_... -> https://xxx.yyy/path
+    pattern = re.compile(r'(https?:)?//([a-z0-9-]+)\.translate\.goog', re.IGNORECASE)
+
+    def _repl(m):
+        return f"{p.scheme}://{_undash_host(m.group(2))}"
+
+    html = pattern.sub(_repl, html)
+
+    # صور أغلفة مرّت عبر غلاف جوجل: translate.google.com/website?...&u=URL
+    def _img_repl(m):
+        from urllib.parse import unquote
+        return unquote(m.group(1))
+
+    html = re.sub(
+        r'translate\.google\.com/website\?[^"\']*?[&?]u=([^"\'&]+)',
+        _img_repl, html, flags=re.IGNORECASE)
+
+    # إزالة معاملات _x_tr_* المتبقية
+    html = re.sub(r'\?_x_tr_[^"\'&\s>]*', '', html)
+    html = re.sub(r'(&amp;|&)_x_tr_[^"\'&\s>]*', '', html)
+    return html
+
+
+def _looks_blocked(status_code, body):
+    """هل هذا الرد صفحة حجب/تحدي وليس المحتوى الحقيقي؟"""
+    if body is None:
+        return True
+    low = str(body)[:5000].lower()
+    if any(marker in low for marker in _BLOCK_MARKERS):
+        return True
+    if status_code in (401, 403, 429, 503, 502, 521, 522, 523, 525, 530):
+        return True
+    # صفحات الخطأ 400 القصيرة عادةً حجب/رفض وليست محتوى حقيقياً
+    if status_code == 400 and len(low) < 8000:
+        return True
+    return False
+
+
+def _flaresolverr_get(url):
+    """طلب عبر FlareSolverr (يحل تحديات Cloudflare بمتصفح حقيقي) — اختياري"""
+    if not FLARESOLVR_URL:
+        return None
+    try:
+        r = requests.post(
+            f"{FLARESOLVR_URL}/v1",
+            json={'cmd': 'request.get', 'url': url, 'maxTimeout': 60000},
+            timeout=75,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            sol = data.get('solution') or {}
+            body = sol.get('response') or ''
+            status = sol.get('status', 200)
+            if body and status == 200 and not _looks_blocked(200, body):
+                print(f"   🛰️ FlareSolverr: success for {url[:70]}")
+                return SmartResponse(body, 200, route='flaresolverr')
+    except Exception as e:
+        print(f"   FlareSolverr failed: {str(e)[:80]}")
+    return None
+
+
+def _scraperapi_get(url, referer=None):
+    """طلب عبر ScraperAPI (بروكسي سكني) — اختياري بمفتاح مجاني"""
+    if not SCRAPERAPI_KEY:
+        return None
+    try:
+        params = {'api_key': SCRAPERAPI_KEY, 'url': url, 'country_code': 'us'}
+        r = requests.get('https://api.scraperapi.com/', params=params,
+                         headers=get_headers(referer=referer), timeout=70)
+        if r.status_code == 200 and not _looks_blocked(200, r.text):
+            print(f"   🛰️ ScraperAPI: success for {url[:70]}")
+            return SmartResponse(r.text, 200, route='scraperapi')
+    except Exception as e:
+        print(f"   ScraperAPI failed: {str(e)[:80]}")
+    return None
+
+
+def smart_get(url, sl='en', tl='es', referer=None, timeout=25,
+              encoding=None, use_cookies=False, ua=None, lang=None, use_route_cache=True):
+    """
+    طلب ذكي متعدد الطرق (مخصص للمواقع التي تحجب IP السيرفرات):
+      مباشر → بروكسي ترجمة جوجل → FlareSolverr (اختياري) → ScraperAPI (اختياري)
+    يعيد SmartResponse/Response أو None إذا فشلت كل الطرق.
+    """
+    parsed = urlparse(url)
+    domain = parsed.netloc
+
+    # قراءة الإعدادات من البيئة عند كل نداء (حتى تعمل التغييرات بدون إعادة نشر)
+    flaresolverr = os.environ.get('FLARESOLVR_URL', '').rstrip('/')
+    scraperapi_key = os.environ.get('SCRAPERAPI_KEY', '')
+    residential = os.environ.get('RESIDENTIAL_PROXY', '')
+
+    cached = _DOMAIN_ROUTE_CACHE.get(domain) if use_route_cache else None
+    direct_status = None
+    direct_body = None
+
+    # ---------- الطريقة 1: الطلب المباشر ----------
+    if cached in (None, 'direct'):
+        proxies = {'http': residential, 'https': residential} if residential else None
+        try:
+            r = requests.get(url, headers=get_headers(referer=referer, use_cookies=use_cookies, ua=ua, lang=lang),
+                             timeout=timeout, allow_redirects=True, proxies=proxies)
+            if encoding:
+                r.encoding = encoding
+            if r.status_code == 200 and not _looks_blocked(200, r.text):
+                if use_route_cache:
+                    _DOMAIN_ROUTE_CACHE[domain] = 'direct'
+                return r
+            direct_status = r.status_code
+            direct_body = r.text
+        except Exception as e:
+            print(f"   direct failed {domain}: {str(e)[:70]}")
+
+        if cached == 'direct':
+            # كان يعمل مباشرة سابقاً لكن فشل الآن — نمسح الذاكرة
+            # ونكمل تلقائياً للطرق البديلة
+            _DOMAIN_ROUTE_CACHE.pop(domain, None)
+            cached = None
+
+    # ---------- الطريقة 2: بروكسي ترجمة جوجل ----------
+    if cached in (None, 'translate'):
+        turl = translate_proxy_url(url, sl=sl, tl=tl)
+        for attempt in range(3):
+            try:
+                r = requests.get(turl, headers=get_headers(ua=ua, lang='en-US,en;q=0.9'),
+                                 timeout=timeout + 15, allow_redirects=True)
+            except Exception as e:
+                print(f"   translate proxy failed {domain}: {str(e)[:70]}")
+                break
+            if r.status_code == 429:
+                wait = 8 + attempt * 7
+                print(f"   ⏳ translate proxy rate-limited, waiting {wait}s ...")
+                time.sleep(wait)
+                continue
+            if r.status_code == 200 and not _looks_blocked(200, r.text):
+                body = _normalize_translate_html(r.text, url)
+                if use_route_cache:
+                    _DOMAIN_ROUTE_CACHE[domain] = 'translate'
+                print(f"   🛰️ via translate proxy: {url[:70]}")
+                return SmartResponse(body, 200, route='translate')
+            break
+
+    # ---------- الطريقة 3: FlareSolverr ----------
+    if flaresolverr:
+        r = _flaresolverr_get(url)
+        if r is not None:
+            if use_route_cache:
+                _DOMAIN_ROUTE_CACHE[domain] = 'flaresolverr'
+            return r
+
+    # ---------- الطريقة 4: ScraperAPI ----------
+    if scraperapi_key:
+        r = _scraperapi_get(url, referer=referer)
+        if r is not None:
+            if use_route_cache:
+                _DOMAIN_ROUTE_CACHE[domain] = 'scraperapi'
+            return r
+
+    # ---------- كل الطرق فشلت ----------
+    if direct_body is not None:
+        return SmartResponse(direct_body, direct_status or 403, route='failed')
+    return None
 
 
 def parse_html(content_or_response, parser='html.parser'):

@@ -24,7 +24,7 @@ from urllib.parse import urljoin, urlparse
 
 from core.registry import register_site
 from core.utils import (
-    http_get, parse_html, get_headers, get_base_url, fix_image_url,
+    http_get, smart_get, parse_html, get_headers, get_base_url, fix_image_url,
     parse_relative_date, extract_chapter_number, clean_text, get_meta,
     UA_CHROME, UA_FIREFOX, UA_MOBILE,
     madara_fetch_metadata, madara_worker,
@@ -202,14 +202,12 @@ def worker_novelfire(url, admin_email, metadata):
 
 
 # ==========================================
-# 🟪 2. NovelMTL + 3. FanMTL (منصة MTLNation)
+# 🟪 2. NovelMTL (novelmtl.com - منصة MTLNation)
 # ==========================================
-# novelmtl.com يعمل مباشرة. fanmtl.com يستخدم نفس المنصة، والقالب
-# القديم (ul.chapter-list) مُبقي كخيار بديل.
+# novelmtl.com يعمل مباشرة بالتصميم الجديد (Quasar).
 
 MTLNATION_SITES = {
     'novelmtl.com': 'https://www.novelmtl.com',
-    'fanmtl.com': 'https://fanmtl.com',
 }
 
 
@@ -351,104 +349,290 @@ def worker_mtlnation(url, admin_email, metadata):
     generic_worker(url, admin_email, metadata, fetch_chapter_list_mtlnation, scrape_chapter_mtlnation)
 
 
-def fetch_chapter_list_fanmtl_legacy(url):
-    """قائمة فصول FanMTL بالقالب القديم (ul.chapter-list) - خيار بديل"""
+# ==========================================
+# 🟪 3. قالب EmpireCMS المشترك (FanMTL + WuxiaBox)
+# ==========================================
+# ⚠️ تحديث مهم (2025): fanmtl.com و wuxiabox.com يعملان بنفس القالب
+# (Empire CMS) الذي ظهر في HTML الموقع الحالي:
+#   - صفحة الرواية: /novel/{slug}.html تحتوي ul.chapter-list
+#   - كل صفحة تعرض 100 فصل، والباقي عبر ترقيم AJAX:
+#     /e/extend/fy.php?page={N}&wjm={slug}   (N يبدأ من 0)
+#   - روابط الفصول: /novel/{slug}_{N}.html
+#   - محتوى الفصل داخل div.chapter-content
+# ⚠️ الموقعان يحجبان IP مراكز البيانات (403 Cloudflare) → نستخدم smart_get
+# الذي ينتقل تلقائياً لبروكسي ترجمة جوجل عند الحجب.
+
+EMPIRECMS_SITES = {
+    'fanmtl.com': 'https://fanmtl.com',
+    'wuxiabox.com': 'https://wuxiabox.com',
+    'wuxiaspot.com': 'https://wuxiaspot.com',
+}
+
+
+def _empire_base(url):
+    for domain, base in EMPIRECMS_SITES.items():
+        if domain in url:
+            return base
+    return 'https://fanmtl.com'
+
+
+def _empire_slug(url):
+    m = re.search(r'/novel/([^/?#]+?)\.html', url)
+    if m:
+        slug = m.group(1)
+    else:
+        m = re.search(r'/novel/([^/?#_]+)', url)
+        slug = m.group(1) if m else ''
+    # إزالة لاحقة الفصل (_5) إن وُجدت
+    slug = re.sub(r'_\d+$', '', slug)
+    return slug
+
+
+def _empire_parse_chapter_list(soup, base):
+    """تحليل ul.chapter-list (روابط الفصول + الأرقام + العناوين + التواريخ)"""
     chapters = []
-    visited_pages = set()
+    for a in soup.select('ul.chapter-list li a'):
+        href = a.get('href') or ''
+        if not href:
+            continue
+        full_link = urljoin(base, href)
+        raw_title = a.get('title') or a.get_text(' ', strip=True)
 
-    try:
-        current_url = url
-
-        while current_url and current_url not in visited_pages:
-            visited_pages.add(current_url)
-            print(f"🔍 Fetching chapters from FanMTL: {current_url}")
-
-            response = http_get(current_url, timeout=15)
-            if response is None or response.status_code != 200:
-                break
-
-            soup = parse_html(response)
-            items = soup.select('ul.chapter-list li a')
-            if not items:
-                break
-
-            for a in items:
-                href = a.get('href')
-                if not href:
-                    continue
-
-                full_link = urljoin('https://fanmtl.com', href)
-                raw_title = a.get('title') or a.get_text(" ", strip=True)
-
-                chapter_no = a.select_one('.chapter-no')
+        number = 0
+        chapter_no = a.select_one('.chapter-no')
+        if chapter_no:
+            try:
+                number = int(chapter_no.get_text(strip=True))
+            except ValueError:
                 number = 0
-                if chapter_no:
-                    try:
-                        number = int(chapter_no.get_text(strip=True))
-                    except ValueError:
-                        number = 0
+        if number == 0:
+            m = re.search(r'_([\d]+)\.html', full_link)
+            if m:
+                number = int(m.group(1))
+        if number == 0:
+            number = extract_chapter_number(raw_title, full_link)
 
-                if number == 0:
-                    number = extract_chapter_number(raw_title, full_link)
+        title_node = a.select_one('.chapter-title')
+        chapter_title = title_node.get_text(strip=True) if title_node else raw_title
 
-                title_node = a.select_one('.chapter-title')
-                chapter_title = title_node.get_text(strip=True) if title_node else raw_title
-
-                if number > 0:
-                    chapters.append({'number': number, 'url': full_link, 'title': chapter_title})
-
-            next_url = None
-            for link in soup.select('.pagination li a'):
-                text = link.get_text(strip=True)
-                href = link.get('href')
-                if href and text == '>':
-                    next_url = urljoin('https://fanmtl.com', href)
-                    break
-
-            current_url = next_url
-            if current_url:
-                time.sleep(0.5)
-
-        chapters = list({c['number']: c for c in chapters}.values())
-        chapters.sort(key=lambda x: x['number'])
-        print(f"✅ Total FanMTL (legacy) chapters found: {len(chapters)}")
-        return chapters
-    except Exception as e:
-        print(f"Error FanMTL List: {e}")
-        return []
-
-
-def fetch_chapter_list_fanmtl(url):
-    """FanMTL: جرّب القالب الجديد أولاً ثم القديم"""
-    chapters = fetch_chapter_list_mtlnation(url)
-    if not chapters:
-        chapters = fetch_chapter_list_fanmtl_legacy(url)
+        if number > 0:
+            chapters.append({'number': number, 'url': full_link, 'title': chapter_title})
     return chapters
 
 
-def scrape_chapter_fanmtl(url):
-    """FanMTL: جرّب القالب الجديد أولاً ثم القديم (.chapter-content)"""
-    content = scrape_chapter_mtlnation(url)
-    if content:
-        return content
+def _empire_fetch_chapters(url, max_pages=300):
+    """جلب كل الفصول: الصفحة الأولى من صفحة الرواية ثم ترقيم fy.php حتى النهاية"""
+    chapters = []
     try:
-        response = http_get(url, timeout=15)
+        base = _empire_base(url)
+        slug = _empire_slug(url)
+        if not slug:
+            print(f"EmpireCMS: cannot extract slug from {url}")
+            return []
+
+        response = smart_get(url, timeout=30)
+        if response is None or response.status_code != 200:
+            print(f"EmpireCMS: novel page failed ({getattr(response, 'status_code', 'None')})")
+            return []
+        soup = parse_html(response)
+        chapters.extend(_empire_parse_chapter_list(soup, base))
+
+        # اكتشاف عدد صفحات الترقيم من رابط ">>" (آخر صفحة)
+        last_page = 0
+        for a in soup.select('.pagination a, .pagination-container a'):
+            href = a.get('href') or ''
+            m = re.search(r'/e/extend/fy\.php\?page=(\d+)', href)
+            if m:
+                last_page = max(last_page, int(m.group(1)))
+
+        print(f"EmpireCMS ({slug}): {len(chapters)} chapters on page 1, last AJAX page={last_page}")
+
+        # جلب بقية الصفحات (ترقيم يبدأ من 0 = الصفحة الأولى)
+        for page in range(0, last_page + 1):
+            if page == 0 and chapters:
+                continue  # الصفحة الأولى جُلبت من صفحة الرواية نفسها
+            ajax_url = f"{base}/e/extend/fy.php?page={page}&wjm={slug}"
+            resp = smart_get(ajax_url, timeout=30)
+            if resp is None or resp.status_code != 200:
+                print(f"EmpireCMS: AJAX page {page} failed, stopping.")
+                break
+            page_soup = parse_html(resp)
+            found = _empire_parse_chapter_list(page_soup, base)
+            if not found:
+                break
+            chapters.extend(found)
+            time.sleep(0.6)
+            if len(chapters) > 20000:
+                break
+
+        # إزالة التكرار (الموقع يعرض نفس الرقم بصيغتين 001 و 1) + ترتيب
+        dedup = {}
+        for c in chapters:
+            if c['number'] not in dedup or len(c['url']) > len(dedup[c['number']]['url']):
+                dedup[c['number']] = c
+        chapters = sorted(dedup.values(), key=lambda x: x['number'])
+        print(f"✅ Total EmpireCMS chapters ({slug}): {len(chapters)}")
+        return chapters
+    except Exception as e:
+        print(f"Error EmpireCMS List: {e}")
+        return []
+
+
+def _empire_scrape_content(url):
+    """سحب محتوى فصل من div.chapter-content مع تنظيف الإعلانات وأدوات القارئ"""
+    try:
+        response = smart_get(url, timeout=30, referer=_empire_base(url) + '/')
         if response is None or response.status_code != 200:
             return None
         soup = parse_html(response)
-        content_div = soup.select_one('.chapter-content')
+
+        content_div = soup.select_one('div.chapter-content') or soup.select_one('article#chapter-article')
         if not content_div:
             return None
-        for bad in content_div.find_all(['script', 'style', 'ins', 'iframe', 'button', 'div']):
+
+        # إزالة الإعلانات والعناصر غير النصية
+        for bad in content_div.find_all(['script', 'style', 'ins', 'iframe', 'button', 'input']):
             bad.decompose()
-        text = clean_text(content_div.get_text(separator="\n\n", strip=True))
-        return text if text else None
+        for div in content_div.find_all('div'):
+            cls = ' '.join(div.get('class') or [])
+            _id = div.get('id') or ''
+            # إعلانات PubFuture/القوائم العائمة وأدوات القارئ
+            if ('PUBFUTURE' in cls or 'pf-' in _id or 'TPuhiHlg' in cls
+                    or 'chapternav' in cls or 'guide-message' in cls
+                    or div.find(['script', 'iframe'])):
+                div.decompose()
+
+        text = content_div.get_text(separator="\n\n", strip=True)
+
+        # تنظيف بقايا HTML المفسّرة داخل النص مثل: <  p idx="6">
+        text = re.sub(r'&lt;\s*p[^&]*&gt;', '', text)
+        text = re.sub(r'<\s*p\s+idx="\d+"\s*>', '', text)
+        # تنظيف أسطر الملاحة/الإعلانات
+        text = re.sub(r'(Previous\s*Chapter\s*\|\s*Next\s*Chapter)', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'Tip:\s*You can use left and right keyboard keys.*', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'Tap the screen to use advanced tools', '', text, flags=re.IGNORECASE)
+        text = clean_text(text)
+        return text if len(text) > 50 else None
     except Exception:
         return None
 
 
+def fetch_metadata_fanmtl(url):
+    """بيانات الرواية من تصميم EmpireCMS الحالي (h1.novel-title و header-stats)"""
+    try:
+        base = _empire_base(url)
+        response = smart_get(url, timeout=30)
+        if response is None or response.status_code != 200:
+            print(f"FanMTL metadata: page fetch failed ({getattr(response, 'status_code', 'None')})")
+            return None
+        soup = parse_html(response)
+
+        # العنوان
+        title = ""
+        h1 = soup.select_one('h1.novel-title') or soup.find('h1')
+        if h1:
+            title = h1.get_text(strip=True)
+        if not title:
+            title = get_meta(soup, name='description') or "Unknown Title"
+        title = re.sub(r'\s*Novel\s*Read\s*Online.*$', '', title, flags=re.IGNORECASE).strip()
+
+        # العنوان الأصلي (صيني) كوسم إضافي
+        tags = []
+        alt = soup.select_one('h2.alternative-title')
+        if alt and alt.get_text(strip=True):
+            tags.append(alt.get_text(strip=True))
+
+        # الغلاف
+        cover = ""
+        img = soup.select_one('figure.cover img') or soup.select_one('.fixed-img img')
+        if img:
+            cover = img.get('data-src') or img.get('src') or ''
+        if not cover:
+            cover = get_meta(soup, prop='og:image')
+        cover = fix_image_url(cover, base_url=base)
+
+        # الوصف
+        description = ""
+        summary_div = soup.select_one('section#info div.summary div.content') or soup.select_one('div.summary .content')
+        if summary_div:
+            description = summary_div.get_text(separator="\n\n", strip=True)
+        if not description:
+            description = get_meta(soup, name='description') or ''
+
+        # الحالة وعدد الفصول من header-stats
+        status = "مستمرة"
+        for strong in soup.select('.header-stats strong'):
+            txt = strong.get_text(strip=True).lower()
+            if 'completed' in txt or 'complete' in txt:
+                status = "مكتملة"
+                break
+
+        # التصنيفات
+        category = "عام"
+        cat_links = soup.select('.categories a.property-item')
+        if cat_links:
+            category = cat_links[0].get_text(strip=True)
+            for c in cat_links:
+                t = c.get_text(strip=True)
+                if t and t not in tags:
+                    tags.append(t)
+
+        # آخر تحديث من تاريخ أول فصل
+        last_update = None
+        first_time = soup.select_one('ul.chapter-list time.chapter-update')
+        if first_time:
+            last_update = parse_relative_date(first_time.get_text(strip=True))
+
+        return {
+            'title': title, 'description': description, 'cover': cover,
+            'status': status, 'category': category, 'tags': tags,
+            'sourceUrl': url, 'lastUpdate': last_update
+        }
+    except Exception as e:
+        print(f"Error FanMTL Meta: {e}")
+        return None
+
+
 def worker_fanmtl(url, admin_email, metadata):
-    generic_worker(url, admin_email, metadata, fetch_chapter_list_fanmtl, scrape_chapter_fanmtl)
+    generic_worker(url, admin_email, metadata, _empire_fetch_chapters, _empire_scrape_content)
+
+
+def fetch_chapter_list_fanmtl(url):
+    return _empire_fetch_chapters(url)
+
+
+def scrape_chapter_fanmtl(url):
+    return _empire_scrape_content(url)
+
+
+# --- WuxiaBox: نفس قالب EmpireCMS بالضبط (novel_{N}.html + fy.php) ---
+
+def _normalize_wuxiabox_url(url):
+    """الروابط القديمة بدون .html أصبحت غير صالحة — نضيفها تلقائياً"""
+    if re.search(r'/novel/[^/]+$', url):
+        if not url.endswith('.html'):
+            url = url.rstrip('/') + '.html'
+    return url
+
+
+def fetch_metadata_wuxiabox(url):
+    url = _normalize_wuxiabox_url(url)
+    meta = fetch_metadata_fanmtl(url)
+    if meta:
+        meta['sourceUrl'] = url
+    return meta
+
+
+def fetch_chapter_list_wuxiabox(url):
+    return _empire_fetch_chapters(_normalize_wuxiabox_url(url))
+
+
+def scrape_chapter_wuxiabox(url):
+    return _empire_scrape_content(url)
+
+
+def worker_wuxiabox(url, admin_email, metadata):
+    generic_worker(url, admin_email, metadata, fetch_chapter_list_wuxiabox, scrape_chapter_wuxiabox)
 
 
 # ==========================================
@@ -466,151 +650,14 @@ def worker_wuxiaworld(url, admin_email, metadata):
 
 
 # ==========================================
-# 🟠 5. WuxiaBox / WuxiaSpot (wuxiabox.com)
-# ==========================================
-# ⚠️ الموقع يعمل لكنه يحجب IP مراكز البيانات (403 Cloudflare).
-# عند التشغيل من سيرفر Railway أو IP سكني يعمل بشكل طبيعي.
-
-def fetch_metadata_wuxiabox(url):
-    try:
-        response = http_get(url, timeout=15)
-        if response is None or response.status_code != 200:
-            return None
-        soup = parse_html(response)
-
-        title_tag = soup.select_one('h1.novel-title')
-        title = title_tag.get_text(strip=True) if title_tag else "Unknown"
-
-        cover = ""
-        img_tag = soup.select_one('figure.cover img')
-        if img_tag:
-            cover = img_tag.get('data-src') or img_tag.get('src')
-
-        base_url = get_base_url(url)
-        cover = fix_image_url(cover, base_url=base_url)
-
-        desc_div = soup.select_one('.summary .content') or soup.select_one('.description')
-        description = desc_div.get_text(separator="\n\n", strip=True) if desc_div else ""
-
-        tags = []
-        for t in soup.select('.tags a.tag'):
-            tags.append(t.get_text(strip=True))
-
-        category = "عام"
-        cat_tag = soup.select_one('.categories a')
-        if cat_tag:
-            category = cat_tag.get_text(strip=True)
-
-        status = "مستمرة"
-        for strong in soup.select('.header-stats strong'):
-            txt = strong.get_text(strip=True).lower()
-            if 'completed' in txt:
-                status = "مكتملة"
-                break
-
-        return {
-            'title': title, 'description': description, 'cover': cover,
-            'status': status, 'category': category, 'tags': tags,
-            'base_url': base_url, 'sourceUrl': url,
-            'lastUpdate': None
-        }
-    except Exception as e:
-        print(f"Error WuxiaBox Meta: {e}")
-        return None
-
-
-def fetch_chapter_list_wuxiabox(url):
-    chapters = []
-    base_url = get_base_url(url)
-
-    try:
-        current_url = url
-
-        while True:
-            print(f"🔍 Fetching chapters from WuxiaBox: {current_url}")
-            response = http_get(current_url, timeout=15)
-            if response is None or response.status_code != 200:
-                break
-
-            soup = parse_html(response)
-
-            chapter_list = soup.select('ul.chapter-list li a')
-            if not chapter_list:
-                break
-
-            for a in chapter_list:
-                href = a.get('href')
-                full_link = urljoin(base_url, href)
-                title = a.get('title') or a.get_text(strip=True)
-
-                num_match = re.search(r'Chapter\s+(\d+)', title, re.IGNORECASE)
-                if not num_match:
-                    num_match = re.search(r'(\d+)', title)
-
-                if num_match:
-                    number = int(num_match.group(1))
-                    chapters.append({'number': number, 'url': full_link, 'title': title})
-
-            # البحث عن الصفحة التالية
-            next_btn = None
-            for link in soup.select('ul.pagination li a'):
-                if '>' in link.get_text() or 'Next' in link.get_text():
-                    next_btn = link
-                    break
-
-            if next_btn:
-                next_href = next_btn.get('href')
-                current_url = urljoin(base_url, next_href)
-                time.sleep(0.5)
-            else:
-                break
-
-        chapters = list({c['number']: c for c in chapters}.values())
-        chapters.sort(key=lambda x: x['number'])
-        return chapters
-
-    except Exception as e:
-        print(f"Error WuxiaBox List: {e}")
-        return []
-
-
-def scrape_chapter_wuxiabox(url):
-    try:
-        res = http_get(url, timeout=15)
-        if res is None or res.status_code != 200:
-            return None
-        soup = parse_html(res)
-
-        content_div = soup.select_one('.chapter-content')
-        if not content_div:
-            return None
-
-        for script in content_div.find_all('script'):
-            script.decompose()
-        for div in content_div.find_all('div'):
-            div.decompose()
-        for style in content_div.find_all('style'):
-            style.decompose()
-
-        text = content_div.get_text(separator="\n\n", strip=True)
-        text = re.sub(r'\(End of this chapter\)', '', text, flags=re.IGNORECASE)
-        text = clean_text(text)
-        return text or None
-    except Exception:
-        return None
-
-
-def worker_wuxiabox(url, admin_email, metadata):
-    generic_worker(url, admin_email, metadata, fetch_chapter_list_wuxiabox, scrape_chapter_wuxiabox)
-
-
-# ==========================================
 # 🔴 6. FreeWebNovel (freewebnovel.com)
 # ==========================================
+# ⚠️ الموقع يحجب IP مراكز البيانات (403) — نستخدم smart_get
+# (مباشر ثم بروكسي ترجمة جوجل تلقائياً)
 
 def fetch_metadata_freewebnovel(url):
     try:
-        response = http_get(url, timeout=15)
+        response = smart_get(url, timeout=25)
         if response is None or response.status_code != 200:
             return None
         soup = parse_html(response)
@@ -656,7 +703,7 @@ def fetch_metadata_freewebnovel(url):
 def fetch_chapter_list_freewebnovel(url):
     chapters = []
     try:
-        response = http_get(url, timeout=15)
+        response = smart_get(url, timeout=25)
         if response is None or response.status_code != 200:
             return []
         soup = parse_html(response)
@@ -682,7 +729,7 @@ def fetch_chapter_list_freewebnovel(url):
 
 def scrape_chapter_freewebnovel(url):
     try:
-        response = http_get(url, timeout=15)
+        response = smart_get(url, timeout=25)
         if response is None or response.status_code != 200:
             return None
         soup = parse_html(response)
@@ -708,25 +755,32 @@ def worker_freewebnovel(url, admin_email, metadata):
 # ==========================================
 # 🏰 7. Royal Road (royalroad.com)
 # ==========================================
-# ⚠️ الموقع يعمل لكنه يحجب IP مراكز البيانات فقط (403).
+# ⚠️ الموقع يحجب IP مراكز البيانات (صفحة Access Denied) — smart_get
+# ينتقل تلقائياً لبروكسي ترجمة جوجل (تم التحقق أنه يعمل).
 # قائمة الفصول تُقرأ من بيانات window.chapters المضمّنة في الصفحة.
 
 def fetch_metadata_royalroad(url):
     try:
-        response = http_get(url, timeout=20)
+        response = smart_get(url, timeout=30)
         if response is None or response.status_code != 200:
             return None
         soup = parse_html(response)
 
         title_tag = soup.select_one('h1.fiction-title') or soup.find('h1')
-        title = title_tag.get_text(strip=True) if title_tag else "Unknown Title"
+        title = title_tag.get_text(strip=True) if title_tag else ""
+        if not title:
+            # بديل: عنوان الصفحة بصيغة "Name | Royal Road"
+            page_title = soup.find('title')
+            if page_title:
+                title = page_title.get_text(strip=True).split('|')[0].strip()
+        title = title or "Unknown Title"
 
         cover = ""
-        img_tag = soup.select_one('.fiction-info img, .cover-art-ego img, header img')
-        if img_tag:
-            cover = img_tag.get('src') or ""
+        # og:image هو الغلاف الحقيقي في Royal Road
+        cover = get_meta(soup, prop='og:image')
         if not cover:
-            cover = get_meta(soup, prop='og:image')
+            img_tag = soup.select_one('.cover-art-ego img, .fiction-info img')
+            cover = img_tag.get('src') if img_tag else ""
         cover = fix_image_url(cover, base_url='https://www.royalroad.com')
 
         desc_div = soup.select_one('.description .hidden-content') or soup.select_one('.description')
@@ -759,7 +813,7 @@ def fetch_chapter_list_royalroad(url):
     """قائمة الفصول من window.chapters JSON المضمّن في صفحة الرواية"""
     chapters = []
     try:
-        response = http_get(url, timeout=20)
+        response = smart_get(url, timeout=30)
         if response is None or response.status_code != 200:
             return []
         html = response.text
@@ -793,7 +847,7 @@ def _royalroad_table_fallback(url):
     """بديل: قراءة جدول الفصول مباشرة من HTML"""
     chapters = []
     try:
-        response = http_get(url, timeout=20)
+        response = smart_get(url, timeout=30)
         if response is None or response.status_code != 200:
             return []
         soup = parse_html(response)
@@ -815,7 +869,7 @@ def _royalroad_table_fallback(url):
 
 def scrape_chapter_royalroad(url):
     try:
-        res = http_get(url, referer='https://www.royalroad.com/', timeout=20)
+        res = smart_get(url, referer='https://www.royalroad.com/', timeout=30)
         if res is None or res.status_code != 200:
             return None
         soup = parse_html(res)
@@ -847,7 +901,7 @@ def worker_royalroad(url, admin_email, metadata):
 
 def fetch_metadata_scribblehub(url):
     try:
-        response = http_get(url, timeout=20)
+        response = smart_get(url, timeout=30)
         if response is None or response.status_code != 200:
             return None
         soup = parse_html(response)
@@ -891,7 +945,8 @@ def fetch_metadata_scribblehub(url):
 
 
 def fetch_chapter_list_scribblehub(url):
-    """قائمة الفصول عبر admin-ajax (wi_getreleases_pagination)"""
+    """قائمة الفصول عبر admin-ajax (wi_getreleases_pagination)
+    نجرب POST مباشر أولاً ثم GET عبر بروكسي الترجمة (نجربة أذكى)"""
     chapters = []
     try:
         # استخراج معرف الرواية من الرابط /series/{id}/{slug}/
@@ -901,46 +956,64 @@ def fetch_chapter_list_scribblehub(url):
             return []
         series_id = match.group(1)
 
-        response = requests.post(
-            'https://www.scribblehub.com/wp-admin/admin-ajax.php',
-            data={
-                'action': 'wi_getreleases_pagination',
-                'pagenum': '-1',
-                'mypostid': series_id,
-            },
-            headers=get_headers(referer=url),
-            timeout=30,
-        )
-        if response.status_code != 200:
-            print(f"ScribbleHub ajax failed: HTTP {response.status_code}")
-            return []
+        # 1) POST مباشر (يعمل إذا كان IP السيرفر غير محجوب)
+        try:
+            response = requests.post(
+                'https://www.scribblehub.com/wp-admin/admin-ajax.php',
+                data={
+                    'action': 'wi_getreleases_pagination',
+                    'pagenum': '-1',
+                    'mypostid': series_id,
+                },
+                headers=get_headers(referer=url),
+                timeout=30,
+            )
+            if response.status_code == 200 and 'toc_w' in response.text:
+                soup = parse_html(response.content)
+                return _scribblehub_parse_toc(soup)
+        except Exception as e:
+            print(f"ScribbleHub direct POST failed: {str(e)[:60]}")
 
-        soup = parse_html(response.content)
+        # 2) GET عبر smart_get (بروكسي الترجمة يمرر admin-ajax أحياناً)
+        ajax_url = ('https://www.scribblehub.com/wp-admin/admin-ajax.php'
+                    f'?action=wi_getreleases_pagination&pagenum=-1&mypostid={series_id}')
+        response = smart_get(ajax_url, timeout=35, referer=url)
+        if response is not None and response.status_code == 200 and 'toc_w' in response.text:
+            soup = parse_html(response.content)
+            return _scribblehub_parse_toc(soup)
 
-        rows = soup.select('.toc_w')
-        for i, el in enumerate(rows, start=1):
-            a = el.find('a')
-            if not a or not a.get('href'):
-                continue
-            chapter_url = a['href']
-            title = el.select_one('.toc_a')
-            chapter_title = title.get_text(strip=True) if title else f"Chapter {i}"
-            chapters.append({'number': i, 'url': chapter_url, 'title': chapter_title})
-
-        # الفصول تأتي عكسية أحياناً
-        if chapters and chapters[0]['number'] == 1:
-            chapters.reverse()
-        chapters.sort(key=lambda x: x['number'])
-        print(f"✅ ScribbleHub chapters found: {len(chapters)}")
-        return chapters
+        print("ScribbleHub: TOC blocked from this server (Cloudflare). "
+              "اضبط FLARESOLVR_URL أو SCRAPERAPI_KEY لتفعيل هذا الموقع.")
+        return []
     except Exception as e:
         print(f"Error ScribbleHub List: {e}")
         return []
 
 
+def _scribblehub_parse_toc(soup):
+    """تحليل قائمة الفصول من HTML الذي أعاده admin-ajax"""
+    chapters = []
+    rows = soup.select('.toc_w')
+    for i, el in enumerate(rows, start=1):
+        a = el.find('a')
+        if not a or not a.get('href'):
+            continue
+        chapter_url = a['href']
+        title = el.select_one('.toc_a')
+        chapter_title = title.get_text(strip=True) if title else f"Chapter {i}"
+        chapters.append({'number': i, 'url': chapter_url, 'title': chapter_title})
+
+    # الفصول تأتي عكسية أحياناً
+    if chapters and chapters[0]['number'] == 1:
+        chapters.reverse()
+    chapters.sort(key=lambda x: x['number'])
+    print(f"✅ ScribbleHub chapters found: {len(chapters)}")
+    return chapters
+
+
 def scrape_chapter_scribblehub(url):
     try:
-        res = http_get(url, referer='https://www.scribblehub.com/', timeout=20)
+        res = smart_get(url, referer='https://www.scribblehub.com/', timeout=30)
         if res is None or res.status_code != 200:
             return None
         soup = parse_html(res)
@@ -965,31 +1038,67 @@ def worker_scribblehub(url, admin_email, metadata):
 # ==========================================
 # 📦 9. NovelBin (novelbin.net)
 # ==========================================
-# ⚠️ الموقع يستخدم حماية JS (JwtRoad) تحل تلقائياً بالمتابعة،
-# لكنه يفشل من IP مراكز البيانات أحياناً.
+# ⚠️ الموقع يستخدم حماية JS (صفحة Loading... مع توكن JWT) ثم
+# يحول أحياناً لمضيف ميت ww80.novelbin.net — نعيد كتابة المضيف.
+# نستخدم smart_get كطبقة إضافية عند الحجب.
 
-def _novelbin_session_get(url, referer=None, max_retries=3):
-    """طلب مع محاولة حل حماية JS الخاصة بـ NovelBin"""
+_NOVELBIN_HOSTS = ('ww80.novelbin.net', 'ww2.novelbin.net', 'ww10.novelbin.net')
+
+
+def _rewrite_novelbin_url(url):
+    """إعادة توجيه المضيفات الميتة إلى النطاق الرئيسي"""
+    for host in _NOVELBIN_HOSTS:
+        if host in url:
+            return url.replace(f'http://{host}', 'https://novelbin.net').replace(f'https://{host}', 'https://novelbin.net')
+    return url
+
+
+def _novelbin_session_get(url, referer=None, max_retries=4):
+    """طلب مع محاولة حل حماية JS الخاصة بـ NovelBin (توكن JWT + تحويلات)"""
     session = requests.Session()
     headers = get_headers(ua=UA_CHROME, referer=referer)
 
     try:
-        r = session.get(url, headers=headers, timeout=25)
+        r = session.get(url, headers=headers, timeout=25, allow_redirects=False)
 
-        # إذا كانت الصفحة صفحة التحدي "Loading..." نتابع إعادة التوجيه
+        # متابعة التحويلات يدوياً مع إصلاح المضيفات الميتة
+        hops = 0
+        while r.status_code in (301, 302, 307, 308) and hops < 6:
+            nxt = _rewrite_novelbin_url(r.headers.get('Location', ''))
+            if not nxt:
+                break
+            r = session.get(nxt, headers=headers, timeout=25, allow_redirects=False)
+            hops += 1
+
+        # إذا كانت الصفحة صفحة التحدي "Loading..." نتابع إعادة التوجيه JS
         for _ in range(max_retries):
             if 'window.location.replace' in r.text and r.status_code == 200:
                 m = re.search(r"window\.location\.replace\('([^']+)'\)", r.text)
                 if not m:
                     break
-                r = session.get(m.group(1), headers=headers, timeout=25)
+                nxt = _rewrite_novelbin_url(m.group(1))
+                r = session.get(nxt, headers=headers, timeout=25, allow_redirects=False)
+                # متابعة أي تحويلات HTTP بعد التحويل JS
+                hops = 0
+                while r.status_code in (301, 302, 307, 308) and hops < 6:
+                    nxt = _rewrite_novelbin_url(r.headers.get('Location', ''))
+                    if not nxt:
+                        break
+                    r = session.get(nxt, headers=headers, timeout=25, allow_redirects=False)
+                    hops += 1
             else:
                 break
 
+        # إن بقينا عالقين في التحدي، جرب عبر smart_get (بروكسي ترجمة)
+        if 'window.location.replace' in r.text or r.status_code != 200:
+            alt = smart_get(url, timeout=30)
+            if alt is not None and alt.status_code == 200 and 'window.location.replace' not in alt.text:
+                return alt
         return r
     except Exception as e:
         print(f"NovelBin session get failed: {e}")
-        return None
+        alt = smart_get(url, timeout=30)
+        return alt
 
 
 def fetch_metadata_novelbin(url):
@@ -1004,6 +1113,11 @@ def fetch_metadata_novelbin(url):
             h1 = soup.select_one('h1')
             title = h1.get_text(strip=True) if h1 else "Unknown Title"
         title = re.sub(r'\s*[-–|]\s*NovelBin.*$', '', title, flags=re.IGNORECASE).strip()
+
+        # إذا كانت الصفحة صفحة التحدي (بدون عنوان حقيقي) فشل الوصول — لا نجلب بيانات وهمية
+        if not title or title.lower() in ('unknown title', 'loading...', 'just a moment...'):
+            print("NovelBin: challenge page detected (title missing).")
+            return None
 
         cover = get_meta(soup, prop='og:image')
         if not cover:
@@ -1341,12 +1455,12 @@ register_site(
     domain_patterns=['fanmtl.com'],
     name='FanMTL',
     language='english',
-    fetch_metadata=fetch_metadata_mtlnation,
+    fetch_metadata=fetch_metadata_fanmtl,
     fetch_chapters=fetch_chapter_list_fanmtl,
     fetch_content=scrape_chapter_fanmtl,
     worker=worker_fanmtl,
     status='active',
-    notes='نفس منصة NovelMTL (قالب جديد + قديم كاحتياط). محجوب عن IP مراكز البيانات فقط.'
+    notes='أعيد بناؤه كلياً لقالب الموقع الحالي (Empire CMS + ترقيم fy.php). يعمل حتى مع حجب IP السيرفرات عبر التوجيه الذكي (smart_get).'
 )
 
 register_site(
@@ -1369,8 +1483,8 @@ register_site(
     fetch_chapters=fetch_chapter_list_wuxiabox,
     fetch_content=scrape_chapter_wuxiabox,
     worker=worker_wuxiabox,
-    status='blocked',
-    notes='الموقع يعمل لكن يحجب IP مراكز البيانات (403 Cloudflare). يعمل من Railway أو IP سكني.'
+    status='active',
+    notes='نفس قالب FanMTL (Empire CMS). الروابط الجديدة تنتهي بـ .html (تُضاف تلقائياً). يعمل عبر التوجيه الذكي رغم حجب IP السيرفرات.'
 )
 
 register_site(
@@ -1382,7 +1496,7 @@ register_site(
     fetch_content=scrape_chapter_freewebnovel,
     worker=worker_freewebnovel,
     status='blocked',
-    notes='الموقع يعمل لكن يحجب IP مراكز البيانات (403). يعمل من Railway أو IP سكني.'
+    notes='يحجب IP السيرفرات وحتى بروكسي جوجل (403 صارم). يحتاج FLARESOLVR_URL أو SCRAPERAPI_KEY. بديل بنفس المحتوى: NovelFire.'
 )
 
 register_site(
@@ -1393,8 +1507,8 @@ register_site(
     fetch_chapters=fetch_chapter_list_royalroad,
     fetch_content=scrape_chapter_royalroad,
     worker=worker_royalroad,
-    status='blocked',
-    notes='جديد! منصة الروايات الأصلية. قائمة الفصول من window.chapters JSON. يحجب IP مراكز البيانات فقط.'
+    status='active',
+    notes='يعمل عبر التوجيه الذكي (بروكسي ترجمة جوجل) رغم حجب IP السيرفرات. الفصول من window.chapters JSON.'
 )
 
 register_site(
@@ -1406,7 +1520,7 @@ register_site(
     fetch_content=scrape_chapter_scribblehub,
     worker=worker_scribblehub,
     status='blocked',
-    notes='جديد! منصة روايات أصلية. الفصول عبر admin-ajax (نفس طريقة LNReader). يحجب IP مراكز البيانات فقط.'
+    notes='حماية Cloudflare صارمة على كل المسارات (حتى بروكسي جوجل محجوب). يحتاج FLARESOLVR_URL أو SCRAPERAPI_KEY.'
 )
 
 register_site(
@@ -1418,7 +1532,7 @@ register_site(
     fetch_content=scrape_chapter_novelbin,
     worker=worker_novelbin,
     status='blocked',
-    notes='جديد! موقع تجميعي شائع. حماية JS تُحل تلقائياً بالمتابعة. يحجب IP مراكز البيانات أحياناً.'
+    notes='متحي تحدي JS (توكن JWT + تحويلات لمضيفات ميتة — يُعالج تلقائياً). من IP السيرفرات يحتاج FLARESOLVR_URL أو SCRAPERAPI_KEY.'
 )
 
 register_site(
