@@ -1407,3 +1407,397 @@ register_site(
     status='active',
     notes='جديد (من LNReader)! فهرس عبر /{id}/dir. Cloudflare متقلب أحياناً من IP السيرفرات.'
 )
+
+
+# ==========================================
+# 📖 9. Twkan (twkan.com / twkan.cc) - 台灣小說網
+# ==========================================
+# نطاقان لنفس قاعدة البيانات لكن بقالبين مختلفين تماماً:
+#
+#   twkan.cc (قالب جديد) — مفتوح حالياً ويعمل مباشرة (موصى به):
+#     كتاب /book/{نص}.html | فهرس /chapter/{id}.html + ترقيم /{صفحة}.html
+#     فصل /chapter/{id}/{ch}.html | المحتوى div#content بفقرات <p>
+#     المحددات: h1.booktitle، p.booktag (a.red مؤلف / a.blue تصنيف / span.red حالة)،
+#               p.bookintro، img.thumbnail
+#
+#   twkan.com (قالب جيتشي القديم) — خلف Cloudflare صارم: تحدي مُدار + صفحات خداع
+#     تُرجع محتوى 200 مزيف حتى لبروكسي ترجمة جوجل ("Leap of Faith...") → كل
+#     الطلبات عبر smart_get مع كاشف الخداع؛ من IP مراكز البيانات يحتاج
+#     FLARESOLVR_URL أو SCRAPERAPI_KEY:
+#     كتاب /book/{رقم}.html (h1>a، المؤلف /author/..، التصنيف /novels/class/..،
+#               الغلاف og:image، الوصف og:description)
+#     الفهرس الكامل: /ajax_novels/chapterlist/{id}.html (li data-num > a مطلقة /txt/{id}/{ch})
+#     الفصل /txt/{id}/{ch} — المحتوى div#txtcontent0 بنص <br> (لا يوجد تقسيم داخلي)
+
+TWKAN_MAX_LIST_PAGES = 120  # شبكة أمان لترقيم فهرس twkan.cc (501 فصلاً/صفحة)
+
+
+def _twkan_validate(body):
+    """كاشف صفحات الخداع/التحدي — يقبل القالبين ويرفض أي صفحة بلا بصمة الموقع"""
+    if not body:
+        return False
+    if '台灣小說網' not in body:
+        return False
+    # صفحات القالب الجديد: صفحة كتاب (booktitle/readcontent) أو فصل (id="content")
+    # أو صفحات فهرس الفصول (روابط /chapter/) أو قالب جيتشي القديم (روابط /txt/ ...)
+    if any(m in body for m in ('/chapter/', 'booktitle', 'readcontent', 'id="content"')):
+        return True
+    return any(m in body for m in ('txtcontent', '/txt/', 'novels/class',
+                                   'ajax_novels', 'files/article'))
+
+
+def _twkan_get(url, timeout=30):
+    """طلب موحّد عبر التوجيه الذكي مع كاشف الخداع (عناوين تقليدية zh-TW)"""
+    return smart_get(url, sl='zh-TW', tl='en', lang='zh-TW,zh;q=0.9,en;q=0.5',
+                     timeout=timeout, validate=_twkan_validate, ua=UA_FIREFOX)
+
+
+def _twkan_is_new_style(url):
+    """twkan.cc = القالب الجديد، ما عدا ذلك = قالب جيتشي القديم"""
+    return 'twkan.cc' in (urlparse(url).netloc.lower())
+
+
+def _twkan_book_id(url):
+    """معرف الكتاب من أي رابط (كتاب/فصل/فهرس) — يدعم الصيغتين"""
+    m = re.search(r'/book/([0-9A-Za-z]+)\.html', url)
+    if m:
+        return m.group(1)
+    m = re.search(r'/chapter/([0-9A-Za-z]+)', url)
+    if m:
+        return m.group(1)
+    m = re.search(r'/txt/(\d+)/', url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _twkan_book_url(url):
+    """تحويل أي رابط إلى رابط صفحة الكتاب على نفس النطاق"""
+    bid = _twkan_book_id(url)
+    if not bid:
+        return url
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}/book/{bid}.html"
+
+
+def _twkan_meta_new(soup, book_url):
+    """استخراج البيانات من قالب twkan.cc الجديد"""
+    title_tag = soup.select_one('h1.booktitle') or soup.find('h1')
+    title = title_tag.get_text(strip=True) if title_tag else ""
+    if not title:
+        return None
+
+    cover = ""
+    img_tag = soup.select_one('img.thumbnail') or soup.select_one('.book img')
+    if img_tag:
+        cover = img_tag.get('src') or img_tag.get('data-src') or ""
+    if not cover:
+        cover = get_meta(soup, prop='og:image') or ""
+    cover = fix_image_url(cover, base_url=book_url)
+
+    author, category, status = "", "عام", "مستمرة"
+    tag_p = soup.select_one('p.booktag')
+    if tag_p:
+        a_red = tag_p.select_one('a.red')
+        if a_red:
+            author = a_red.get_text(strip=True)
+        a_blue = tag_p.select_one('a.blue')
+        if a_blue and a_blue.get_text(strip=True):
+            category = a_blue.get_text(strip=True)
+        for sp in tag_p.find_all('span'):
+            st = sp.get_text(strip=True)
+            if '完結' in st or '完结' in st:
+                status = "مكتملة"
+                break
+
+    desc_p = soup.select_one('p.bookintro')
+    description = desc_p.get_text('\n', strip=True) if desc_p \
+        else (get_meta(soup, name='description') or "")
+    # إزالة جُمل الدعاية الختامية المضافة من الموقع نفسه
+    description = re.sub(r'本書由[^。]*呈現[^。]*。?', '', description).strip()
+    description = re.sub(r'《[^》]+》是作家「[^」]*」傾力打造[^。]*。?', '', description).strip()
+
+    tags = [category] if category and category != "عام" else []
+    return {'title': title, 'description': description, 'cover': cover,
+            'author': author, 'status': status, 'category': category, 'tags': tags}
+
+
+def _twkan_meta_old(soup, book_url):
+    """استخراج البيانات من قالب twkan.com (جيتشي)"""
+    h1 = soup.find('h1')
+    title = h1.get_text(strip=True) if h1 else ""
+    if not title:
+        return None
+
+    cover = get_meta(soup, prop='og:image') or ""
+    cover = fix_image_url(cover, base_url=book_url)
+
+    author = ""
+    a_author = soup.select_one('a[href*="/author/"]')
+    if a_author:
+        author = a_author.get_text(strip=True)
+
+    category = "عام"
+    a_cat = soup.select_one('a[href*="/novels/class/"]')
+    if a_cat and a_cat.get_text(strip=True):
+        category = a_cat.get_text(strip=True)
+
+    # الحالة من فقرة المعلومات نفسها (تحتوي 萬字) — لا من الصفحة كلها
+    # (الشريط الجانبي يعرض كتباً مكتملة فيلوّث الفحص الشامل)
+    status = "مستمرة"
+    for p in soup.find_all('p'):
+        pt = p.get_text()
+        if '萬字' in pt or '万字' in pt:
+            if '完結' in pt or '完结' in pt or '完本' in pt:
+                status = "مكتملة"
+            break
+
+    # الوصف الحقيقي في og:description (بفواصل <br />)
+    description = get_meta(soup, prop='og:description') or ""
+    description = description.replace('<br />', '\n').replace('<br>', '\n').strip()
+    if not description:
+        description = get_meta(soup, name='description') or ""
+
+    tags = [category] if category and category != "عام" else []
+    return {'title': title, 'description': description, 'cover': cover,
+            'author': author, 'status': status, 'category': category, 'tags': tags}
+
+
+def fetch_metadata_twkan(url):
+    try:
+        book_url = _twkan_book_url(url)
+        response = _twkan_get(book_url)
+        if response is None or response.status_code != 200:
+            return None
+        soup = parse_html(response)
+        # كشف القالب صراحةً: booktag/booktitle = قالب .cc الجديد، وإلا جرّب جيتشي
+        meta = None
+        if soup.select_one('p.booktag') or soup.select_one('h1.booktitle'):
+            meta = _twkan_meta_new(soup, book_url)
+        if meta is None:
+            meta = _twkan_meta_old(soup, book_url)
+        if meta:
+            meta['sourceUrl'] = book_url
+            meta['lastUpdate'] = None
+        return meta
+    except Exception as e:
+        print(f"Error twkan metadata: {e}")
+        return None
+
+
+def _twkan_chapters_new(url, bid):
+    """فهرس twkan.cc: صفحات متتابعة /chapter/{id}[/{صفحة}].html"""
+    base = get_base_url(url)
+    bid_q = re.escape(bid)
+    chapters, seen = [], set()
+    index = 0
+    page_no = 1
+    while page_no <= TWKAN_MAX_LIST_PAGES:
+        list_url = f"{base}/chapter/{bid}.html" if page_no == 1 \
+            else f"{base}/chapter/{bid}/{page_no}.html"
+        response = _twkan_get(list_url)
+        if response is None or response.status_code != 200:
+            break
+        soup = parse_html(response)
+
+        page_new = 0
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            m = re.search(rf'/chapter/{bid_q}/([0-9A-Za-z]+)\.html$', href)
+            if not m:
+                continue
+            full = urljoin(base, href)
+            if full in seen:
+                continue
+            seen.add(full)
+            index += 1
+            page_new += 1
+            chapters.append({'number': index, 'url': full,
+                             'title': a.get_text(strip=True)})
+
+        if page_new == 0:
+            break  # لا فصول جديدة = آخر صفحة
+        page_no += 1
+        time.sleep(0.4)  # مهلة أدب بين صفحات الفهرس
+
+    return chapters
+
+
+def _twkan_chapters_old(url, bid):
+    """فهرس twkan.com الكامل: /ajax_novels/chapterlist/{id}.html (روابط مطلقة)"""
+    base = get_base_url(url)
+    list_url = f"{base}/ajax_novels/chapterlist/{bid}.html"
+    response = _twkan_get(list_url, timeout=40)
+    if response is None or response.status_code != 200:
+        return []
+    soup = parse_html(response)
+
+    chapters, seen = [], set()
+    index = 0
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        m = re.search(rf'/txt/{re.escape(bid)}/(\d+)$', href)
+        if not m:
+            continue
+        full = urljoin(base, href)
+        if full in seen:
+            continue
+        seen.add(full)
+        index += 1
+        chapters.append({'number': index, 'url': full,
+                         'title': a.get_text(strip=True)})
+
+    return chapters
+
+
+def _twkan_find_cc_twin(title):
+    """البحث عن توأم الكتاب على twkan.cc (نفس قاعدة البيانات، بدون حماية)
+    يُستخدم عندما يمنع خداع Cloudflare فهرس twkan.com — يعيد رابط .cc أو None"""
+    try:
+        from urllib.parse import quote
+        q = quote((title or '').strip())
+        if not q:
+            return None
+        r = _twkan_get(f"https://twkan.cc/search/{q}.html")
+        if r is None or r.status_code != 200:
+            return None
+        soup = parse_html(r)
+        target = re.sub(r'\s+', '', title)
+        for a in soup.find_all('a', href=True):
+            m = re.search(r'/book/([0-9A-Za-z]+)\.html$', a['href'])
+            if not m:
+                continue
+            t = re.sub(r'\s+', '', a.get_text(strip=True))
+            if t and t == target:
+                return f"https://twkan.cc/book/{m.group(1)}.html"
+        return None
+    except Exception:
+        return None
+
+
+def fetch_chapter_list_twkan(url):
+    try:
+        bid = _twkan_book_id(url)
+        if not bid:
+            return []
+        chapters = _twkan_chapters_new(url, bid) if _twkan_is_new_style(url) \
+            else _twkan_chapters_old(url, bid)
+        print(f"✅ twkan chapters found: {len(chapters)}")
+        return chapters
+    except Exception as e:
+        print(f"Error twkan chapter list: {e}")
+        return []
+
+
+def scrape_chapter_twkan(url):
+    """سحب محتوى فصل — يدعم القالبين (div#content أو div#txtcontent*)"""
+    try:
+        base = get_base_url(url)
+        response = _twkan_get(url)
+        if response is None or response.status_code != 200:
+            return None
+        soup = parse_html(response)
+
+        parts = []
+        # القالب الجديد: حاوية واحدة
+        content_div = soup.select_one('div#content') or soup.select_one('div.readcontent')
+        if content_div is not None:
+            for bad in content_div.find_all(['script', 'style', 'ins', 'iframe']):
+                bad.decompose()
+            for a in content_div.find_all('a'):
+                a.unwrap()
+            txt = content_div.get_text(separator='\n\n', strip=True)
+            if txt:
+                parts.append(txt)
+        else:
+            # قالب جيتشي: txtcontent0 (+ أي أجزاء إضافية نظرياً) بنص <br>
+            for div in soup.select('div[id^="txtcontent"]'):
+                for bad in div.find_all(['script', 'style', 'ins', 'iframe']):
+                    bad.decompose()
+                for a in div.find_all('a'):
+                    a.unwrap()
+                txt = div.get_text(separator='\n', strip=True)
+                if txt:
+                    parts.append(txt)
+
+        text = clean_text('\n\n'.join(parts))
+        if len(text.strip()) < 50:
+            return None
+        return text
+    except Exception:
+        return None
+
+
+def worker_twkan(url, admin_email, metadata):
+    """عامل مخصص: منطق generic_worker + ذكاء إضافي —
+    إذا حجب خداع Cloudflare فهرس twkan.com، يبحث عن توأم الكتاب على twkan.cc
+    (نفس قاعدة البيانات، مفتوح بدون حماية) ويسحب الفصول والمحتوى منه مباشرة"""
+    from .backend import send_data_to_backend, check_existing_chapters
+
+    try:
+        existing_chapters = check_existing_chapters(metadata['title'])
+    except Exception:
+        existing_chapters = []
+    skip_meta = len(existing_chapters) > 0
+
+    send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata,
+                          'chapters': [], 'skipMetadataUpdate': skip_meta})
+
+    bid = _twkan_book_id(url)
+    all_chapters = []
+    if _twkan_is_new_style(url):
+        all_chapters = _twkan_chapters_new(url, bid)
+    else:
+        all_chapters = _twkan_chapters_old(url, bid)
+        if not all_chapters and bid:
+            print("   ↪️ twkan.com index blocked/decoyed — trying twkan.cc twin ...")
+            twin = _twkan_find_cc_twin(metadata.get('title', ''))
+            if twin:
+                print(f"   ✅ twin found: {twin}")
+                all_chapters = _twkan_chapters_new(twin, _twkan_book_id(twin))
+
+    if not all_chapters:
+        print(f"No chapters found for {metadata['title']}")
+        return
+
+    print(f"Processing {len(all_chapters)} chapters.")
+    batch = []
+    for chap in all_chapters:
+        if chap['number'] in existing_chapters:
+            continue
+
+        print(f"Scraping {metadata.get('title', '?')}: Ch {chap['number']}...")
+        try:
+            content = scrape_chapter_twkan(chap['url'])
+        except Exception as e:
+            print(f"❌ content failed: {e}")
+            content = None
+
+        if content:
+            batch.append({'number': chap['number'], 'title': chap['title'], 'content': content})
+            if len(batch) >= 5:
+                send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata,
+                                      'chapters': batch, 'skipMetadataUpdate': True})
+                batch = []
+                time.sleep(1.0)
+
+    if batch:
+        send_data_to_backend({'adminEmail': admin_email, 'novelData': metadata,
+                              'chapters': batch, 'skipMetadataUpdate': True})
+
+
+register_site(
+    domain_patterns=['twkan.com', 'twkan.cc'],
+    name='Twkan (台灣小說網)',
+    language='chinese',
+    fetch_metadata=fetch_metadata_twkan,
+    fetch_chapters=fetch_chapter_list_twkan,
+    fetch_content=scrape_chapter_twkan,
+    worker=worker_twkan,
+    status='active',
+    notes='نطاقان لقاعدة بيانات واحدة بقالبين: twkan.cc (جديد، يعمل مباشرة — موصى به) '
+          'وtwkan.com (جيتشي قديم، خلف Cloudflare صارم بتحدي مُدار وصفحات خداع 200 مزيفة) '
+          'يُتعامل معه عبر smart_get + كاشف الخداع، ومن IP مراكز البيانات يحتاج '
+          'FLARESOLVR_URL أو SCRAPERAPI_KEY. الفهرس الكامل على .com عبر '
+          '/ajax_novels/chapterlist/{id}.html.'
+)

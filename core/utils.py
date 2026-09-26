@@ -181,7 +181,7 @@ def _looks_blocked(status_code, body):
     return False
 
 
-def _flaresolverr_get(url):
+def _flaresolverr_get(url, validate=None):
     """طلب عبر FlareSolverr (يحل تحديات Cloudflare بمتصفح حقيقي) — اختياري"""
     if not FLARESOLVR_URL:
         return None
@@ -196,7 +196,8 @@ def _flaresolverr_get(url):
             sol = data.get('solution') or {}
             body = sol.get('response') or ''
             status = sol.get('status', 200)
-            if body and status == 200 and not _looks_blocked(200, body):
+            if body and status == 200 and not _looks_blocked(200, body) \
+                    and (validate is None or validate(body)):
                 print(f"   🛰️ FlareSolverr: success for {url[:70]}")
                 return SmartResponse(body, 200, route='flaresolverr')
     except Exception as e:
@@ -204,7 +205,7 @@ def _flaresolverr_get(url):
     return None
 
 
-def _scraperapi_get(url, referer=None):
+def _scraperapi_get(url, referer=None, validate=None):
     """طلب عبر ScraperAPI (بروكسي سكني) — اختياري بمفتاح مجاني"""
     if not SCRAPERAPI_KEY:
         return None
@@ -212,7 +213,8 @@ def _scraperapi_get(url, referer=None):
         params = {'api_key': SCRAPERAPI_KEY, 'url': url, 'country_code': 'us'}
         r = requests.get('https://api.scraperapi.com/', params=params,
                          headers=get_headers(referer=referer), timeout=70)
-        if r.status_code == 200 and not _looks_blocked(200, r.text):
+        if r.status_code == 200 and not _looks_blocked(200, r.text) \
+                and (validate is None or validate(r.text)):
             print(f"   🛰️ ScraperAPI: success for {url[:70]}")
             return SmartResponse(r.text, 200, route='scraperapi')
     except Exception as e:
@@ -221,11 +223,16 @@ def _scraperapi_get(url, referer=None):
 
 
 def smart_get(url, sl='en', tl='es', referer=None, timeout=25,
-              encoding=None, use_cookies=False, ua=None, lang=None, use_route_cache=True):
+              encoding=None, use_cookies=False, ua=None, lang=None, use_route_cache=True,
+              validate=None):
     """
     طلب ذكي متعدد الطرق (مخصص للمواقع التي تحجب IP السيرفرات):
       مباشر → بروكسي ترجمة جوجل → FlareSolverr (اختياري) → ScraperAPI (اختياري)
     يعيد SmartResponse/Response أو None إذا فشلت كل الطرق.
+
+    validate: دالة اختيارية (body -> bool) للتحقق أن المحتوى حقيقي وليس صفحة خداع
+    (بعض المواقع خلف Cloudflare تُرجع صفحات 200 مزيفة لبروكسي جوجل — مثل twkan.com)؛
+    أي رد يفشل التحقق يُعامل كحجب ويُنتقل للطريقة التالية دون تخزين الطريقة الفاشلة.
     """
     parsed = urlparse(url)
     domain = parsed.netloc
@@ -247,7 +254,8 @@ def smart_get(url, sl='en', tl='es', referer=None, timeout=25,
                              timeout=timeout, allow_redirects=True, proxies=proxies)
             if encoding:
                 r.encoding = encoding
-            if r.status_code == 200 and not _looks_blocked(200, r.text):
+            if r.status_code == 200 and not _looks_blocked(200, r.text) \
+                    and (validate is None or validate(r.text)):
                 if use_route_cache:
                     _DOMAIN_ROUTE_CACHE[domain] = 'direct'
                 return r
@@ -265,7 +273,7 @@ def smart_get(url, sl='en', tl='es', referer=None, timeout=25,
     # ---------- الطريقة 2: بروكسي ترجمة جوجل ----------
     if cached in (None, 'translate'):
         turl = translate_proxy_url(url, sl=sl, tl=tl)
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 r = requests.get(turl, headers=get_headers(ua=ua, lang='en-US,en;q=0.9'),
                                  timeout=timeout + 15, allow_redirects=True)
@@ -279,15 +287,20 @@ def smart_get(url, sl='en', tl='es', referer=None, timeout=25,
                 continue
             if r.status_code == 200 and not _looks_blocked(200, r.text):
                 body = _normalize_translate_html(r.text, url)
-                if use_route_cache:
-                    _DOMAIN_ROUTE_CACHE[domain] = 'translate'
-                print(f"   🛰️ via translate proxy: {url[:70]}")
-                return SmartResponse(body, 200, route='translate')
+                if validate is None or validate(body):
+                    if use_route_cache:
+                        _DOMAIN_ROUTE_CACHE[domain] = 'translate'
+                    print(f"   🛰️ via translate proxy: {url[:70]}")
+                    return SmartResponse(body, 200, route='translate')
+                # محتوى مزييف (صفحة خداع متقطعة) — أعد المحاولة قبل الاستسلام
+                print(f"   ⚠️ translate proxy decoy for {domain} (attempt {attempt + 1}/4)")
+                time.sleep(2 + attempt * 2)
+                continue
             break
 
     # ---------- الطريقة 3: FlareSolverr ----------
     if flaresolverr:
-        r = _flaresolverr_get(url)
+        r = _flaresolverr_get(url, validate=validate)
         if r is not None:
             if use_route_cache:
                 _DOMAIN_ROUTE_CACHE[domain] = 'flaresolverr'
@@ -295,7 +308,7 @@ def smart_get(url, sl='en', tl='es', referer=None, timeout=25,
 
     # ---------- الطريقة 4: ScraperAPI ----------
     if scraperapi_key:
-        r = _scraperapi_get(url, referer=referer)
+        r = _scraperapi_get(url, referer=referer, validate=validate)
         if r is not None:
             if use_route_cache:
                 _DOMAIN_ROUTE_CACHE[domain] = 'scraperapi'
