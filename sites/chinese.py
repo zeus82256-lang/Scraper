@@ -1732,7 +1732,7 @@ def worker_twkan(url, admin_email, metadata):
     """عامل مخصص: منطق generic_worker + ذكاء إضافي —
     إذا حجب خداع Cloudflare فهرس twkan.com، يبحث عن توأم الكتاب على twkan.cc
     (نفس قاعدة البيانات، مفتوح بدون حماية) ويسحب الفصول والمحتوى منه مباشرة"""
-    from .backend import send_data_to_backend, check_existing_chapters
+    from core.backend import send_data_to_backend, check_existing_chapters
 
     try:
         existing_chapters = check_existing_chapters(metadata['title'])
